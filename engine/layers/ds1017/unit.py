@@ -42,6 +42,7 @@ import os
 import weakref
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
+from types import MappingProxyType
 from typing import Any
 
 import torch
@@ -68,6 +69,11 @@ DEFINITIONS = ("ds.linear@1", "ds.rms_norm@1", "ds.transform@1", "ds.store_cache
 
 MEGA = frozenset({"deepinfer.ds.moe@1"})
 """Solutions that read the expert stacks in the fused MoE kernel's row order (``formats.expert_layout``)."""
+
+_HC_KEYS = MappingProxyType({
+    "attn": ("hc_attn_fn", "hc_attn_scale", "hc_attn_base", "attn_norm.weight"),
+    "ffn": ("hc_ffn_fn", "hc_ffn_scale", "hc_ffn_base", "ffn_norm.weight"),
+})
 
 Weights = Mapping[str, torch.Tensor]
 
@@ -226,6 +232,14 @@ class Layers:
         self.yoco_mode = str(config["dsv4.yoco_mode"])
         self.yoco_keep = int(config["dsv4.yoco_keep_tokens"])
         self.yoco_paged_consumer = bool(config["dsv4.yoco_paged_consumer"]) if "dsv4.yoco_paged_consumer" in config else True
+        self.decode_overlap = bool(config["dsv4.decode_overlap"]) if "dsv4.decode_overlap" in config else True
+        self._aux_stream: torch.cuda.Stream | None = None
+        self._ev_fork: torch.cuda.Event | None = None
+        self._ev_join: torch.cuda.Event | None = None
+        self._ev_begin_join: torch.cuda.Event | None = None
+        self._ev_engram_join: torch.cuda.Event | None = None
+        self._pending_begin_join = False
+        self._pending_engram_join = False
         self.yoco_boundary = cfg.n_prefill_layer
         if self.yoco_mode not in ("off", "compact", "mask"):
             raise ValueError("dsv4.yoco_mode must be off, compact or mask")
@@ -289,8 +303,15 @@ class Layers:
         self.valid_fixed: dict[int, torch.Tensor] = {}
         """Bucket -> bool mask marking real rows vs bucket padding rows."""
         self.fixed_pin: dict[int, torch.Tensor] = {}
+        self._fixed_rows: dict[int, tuple[int, ...]] = {}
         self.valid_count: dict[int, int] = {}
         self._pin_turn = 0
+        self._fns_by_table: dict[str, dict[str, KernelFn]] = {}
+        self._active_fns: dict[str, KernelFn] = {}
+        self._slot_rings_gen: Any = None
+        self._slot_rings: dict[int, torch.Tensor] = {}
+        self._kv_pools_gen: Any = None
+        self._kv_pools: dict[int, Mapping[str, torch.Tensor]] = {}
         self._merged_weights: dict[tuple[Any, ...], tuple[tuple[int, ...], torch.Tensor]] = {}
         self._decode_meta_bufs: dict[tuple[int, int, bool], dict[str, torch.Tensor]] = {}
         self._pre0_buf: tuple[torch.device, torch.Tensor] | None = None
@@ -328,6 +349,7 @@ class Layers:
         self.fixed.clear()
         self.valid_fixed.clear()
         self.fixed_pin.clear()
+        self._fixed_rows.clear()
         self.valid_count.clear()
         self.fetched_fixed.clear()
         self._decode_meta_bufs.clear()
@@ -394,6 +416,11 @@ class Layers:
                     or m.get("ds.index_topk_paged@1", "").split(" ")[0] == "deepinfer.ds.index_topk_paged@1")
                 for t, m in self.chosen.items()
             }
+            by_table: dict[str, dict[str, KernelFn]] = {}
+            for (tbl, defn), fn in self.kernels.fns.items():
+                by_table.setdefault(tbl, {})[defn] = fn
+            self._fns_by_table = by_table
+            self._active_fns = by_table.get(self.table, {})
             self._resolved_version = self.kernels.version
 
     def _warm_prefill(self) -> None:
@@ -575,6 +602,9 @@ class Layers:
         return (*DEFINITIONS, "ds.engram_fetch@1")
 
     def k(self, definition: str) -> KernelFn:
+        fn = self._active_fns.get(definition)
+        if fn is not None:
+            return fn
         return self.kernels(self.table, definition)
 
     def prepare(self, batch: PersistentBatch, plan: BatchPlan, key: PlanKey) -> None:
@@ -582,6 +612,7 @@ class Layers:
             raise ValueError("layers.ds1017 runs no speculative step yet")
         self._sync_flags()
         self.table = GRAPH if key.bucket else key.phase
+        self._active_fns = self._fns_by_table.get(self.table, {})
         self.bucket = key.bucket
         self.batch_tables = batch.binding.buffers()
         device = self.batch_tables["req_to_token"].device
@@ -605,18 +636,22 @@ class Layers:
                     buf = self.fixed[key.bucket] = torch.zeros(key.bucket, dtype=torch.int64, device=device)
                     vbuf = self.valid_fixed[key.bucket] = torch.zeros(key.bucket, dtype=torch.bool, device=device)
                     self.valid_count.pop(key.bucket, None)
+                    self._fixed_rows.pop(key.bucket, None)
                     self.generation += 1
                 n_r = len(rows)
                 if device.type == "cuda":
-                    pin_ring = self.fixed_pin.get(key.bucket)
-                    if pin_ring is None:
-                        pin_ring = self.fixed_pin[key.bucket] = torch.empty(
-                            (8, key.bucket), dtype=torch.int64, pin_memory=True)
-                    pin_slot = pin_ring[self._pin_turn & 7]
-                    self._pin_turn += 1
-                    padded_rows = rows if n_r == key.bucket else [*rows, *([0] * (key.bucket - n_r))]
-                    pin_slot.copy_(torch.tensor(padded_rows, dtype=torch.int64))
-                    buf.copy_(pin_slot, non_blocking=True)
+                    rows_key = tuple(rows)
+                    if self._fixed_rows.get(key.bucket) != rows_key:
+                        pin_ring = self.fixed_pin.get(key.bucket)
+                        if pin_ring is None:
+                            pin_ring = self.fixed_pin[key.bucket] = torch.empty(
+                                (8, key.bucket), dtype=torch.int64, pin_memory=True)
+                        pin_slot = pin_ring[self._pin_turn & 7]
+                        self._pin_turn += 1
+                        padded_rows = rows if n_r == key.bucket else [*rows, *([0] * (key.bucket - n_r))]
+                        pin_slot.copy_(torch.tensor(padded_rows, dtype=torch.int64))
+                        buf.copy_(pin_slot, non_blocking=True)
+                        self._fixed_rows[key.bucket] = rows_key
                 else:
                     buf[:n_r].copy_(on_device(torch.tensor(rows, dtype=torch.int64), device))
                     if n_r < key.bucket:
@@ -663,7 +698,36 @@ class Layers:
             return False
         return sum(self._replay.counts) < total_tokens
 
+    def _get_aux(self, device: torch.device) -> torch.cuda.Stream | None:
+        if not self.decode_overlap or device.type != "cuda":
+            return None
+        if self._aux_stream is None:
+            if torch.cuda.is_current_stream_capturing():
+                return None
+            self._aux_stream = torch.cuda.Stream(device=device)
+            self._ev_fork = torch.cuda.Event(enable_timing=False)
+            self._ev_join = torch.cuda.Event(enable_timing=False)
+            self._ev_begin_join = torch.cuda.Event(enable_timing=False)
+            self._ev_engram_join = torch.cuda.Event(enable_timing=False)
+        return self._aux_stream
+
+    def _wait_begin(self, device: torch.device) -> None:
+        if self._pending_begin_join and self._ev_begin_join is not None:
+            torch.cuda.current_stream(device).wait_event(self._ev_begin_join)
+            self._pending_begin_join = False
+
+    def wait_engram_proj(self, device: torch.device) -> None:
+        if self._pending_engram_join and self._ev_engram_join is not None:
+            torch.cuda.current_stream(device).wait_event(self._ev_engram_join)
+            self._pending_engram_join = False
+
     def end(self) -> None:
+        if self._aux_stream is not None:
+            dev = self._aux_stream.device
+            self._wait_begin(dev)
+            self.wait_engram_proj(dev)
+        self._pending_begin_join = False
+        self._pending_engram_join = False
         self.step.clear()
         self.fetched = None
 
@@ -978,8 +1042,27 @@ class Layers:
 
     # ------------------------------------------------------------------ the forward
 
+    def _refresh_store_caches(self) -> None:
+        if self.cfg.num_hidden_layers:
+            b0 = self.slots.bind(0)
+            r0 = b0.buffers()["ring"]
+            skey = (b0.generation, id(r0))
+            if self._slot_rings_gen != skey:
+                self._slot_rings = {i: self.slots.bind(i).buffers()["ring"] for i in range(self.cfg.num_hidden_layers)}
+                self._slot_rings_gen = skey
+        if self.cfg.kv_source_layer_ids:
+            srcs = [s for s in self.cfg.kv_source_layer_ids if s < self.cfg.num_hidden_layers]
+            if srcs:
+                kb0 = self.kv.bind(srcs[0])
+                kv0 = kb0.buffers()["kv"]
+                kkey = (kb0.generation, id(kv0))
+                if self._kv_pools_gen != kkey:
+                    self._kv_pools = {s: self.kv.bind(s).buffers() for s in srcs}
+                    self._kv_pools_gen = kkey
+
     def begin(self, input_ids: torch.Tensor, positions: torch.Tensor) -> None:
         """Once per forward, before the layers: what every layer shares, and the Engram hash ids."""
+        self._refresh_store_caches()
         tables = self.batch_tables
         slot_table = tables[f"slots.{SLOT_KIND}"]
         rows = self.layout.rows if self.layout is not None else self.decode_rows
@@ -1013,9 +1096,6 @@ class Layers:
             tmap = self.constant("token_map", device) if has_eng else None
             tail = self.slots.bind(self.engram_first).buffers()["tail"] if has_eng else None
             pad_comp = int(self.token_map_host[self.cfg.engram_pad_token_id]) if has_eng else 0
-            fast_triton.decode_begin_meta(
-                rows, positions, input_ids, slot_table, r2t, page, win, bufs, tmap, tail, pad_comp
-            )
             self.step = {
                 "rows": rows,
                 "pos": positions,
@@ -1032,17 +1112,48 @@ class Layers:
                 ("lens32", 2): bufs["lens32_2"],
                 ("comp_dest", 2): (bufs["comp_fc32"], bufs["comp_dc32"]),
             }
-            if has_eng:
-                hashes = self.k("ds.engram_hash@1")(
-                    bufs["engram_tok32"],
-                    self.constant("engram.multipliers", device),
-                    self.constant("engram.primes32", device),
-                    self.constant("engram.offsets32", device),
+            aux = self._get_aux(device)
+            if aux is not None and n_b > 0:
+                main = torch.cuda.current_stream(device)
+                assert self._ev_fork is not None and self._ev_begin_join is not None
+                self._ev_fork.record(main)
+                aux.wait_event(self._ev_fork)
+                rows.record_stream(aux)
+                positions.record_stream(aux)
+                input_ids.record_stream(aux)
+                with torch.cuda.stream(aux):
+                    fast_triton.decode_begin_meta(
+                        rows, positions, input_ids, slot_table, r2t, page, win, bufs, tmap, tail, pad_comp
+                    )
+                    if has_eng:
+                        hashes = self.k("ds.engram_hash@1")(
+                            bufs["engram_tok32"],
+                            self.constant("engram.multipliers", device),
+                            self.constant("engram.primes32", device),
+                            self.constant("engram.offsets32", device),
+                        )
+                        if self.group.size == 1:
+                            hashes.record_stream(main)
+                            self.step["hashes"] = hashes
+                        elif self.engram_staged.get(self.table, False):
+                            self.k("ds.engram_fetch@1")(self.group, hashes, *self.tables(), True)
+                    self._ev_begin_join.record(aux)
+                self._pending_begin_join = True
+            else:
+                fast_triton.decode_begin_meta(
+                    rows, positions, input_ids, slot_table, r2t, page, win, bufs, tmap, tail, pad_comp
                 )
-                if self.group.size == 1:
-                    self.step["hashes"] = hashes
-                elif self.engram_staged.get(self.table, False):
-                    self.k("ds.engram_fetch@1")(self.group, hashes, *self.tables(), True)
+                if has_eng:
+                    hashes = self.k("ds.engram_hash@1")(
+                        bufs["engram_tok32"],
+                        self.constant("engram.multipliers", device),
+                        self.constant("engram.primes32", device),
+                        self.constant("engram.offsets32", device),
+                    )
+                    if self.group.size == 1:
+                        self.step["hashes"] = hashes
+                    elif self.engram_staged.get(self.table, False):
+                        self.k("ds.engram_fetch@1")(self.group, hashes, *self.tables(), True)
             return
 
         slot_raw = slot_table[rows]
@@ -1190,8 +1301,9 @@ class Layers:
             stage = "attn"
         else:
             stage = None
-        return self.k("ds.hc_step@1")(x, stream, pre, post, comb, w[f"hc_{which}_fn"], w[f"hc_{which}_scale"],
-                                       w[f"hc_{which}_base"], w[f"{which}_norm.weight"], cfg.rms_norm_eps,
+        k_fn, k_scale, k_base, k_norm = _HC_KEYS[which]
+        return self.k("ds.hc_step@1")(x, stream, pre, post, comb, w[k_fn], w[k_scale],
+                                       w[k_base], w[k_norm], cfg.rms_norm_eps,
                                        cfg.hc_sinkhorn_iters, cfg.hc_eps, stage)
 
     def hc_pre(self, x: torch.Tensor, pre: torch.Tensor) -> torch.Tensor:
@@ -1203,17 +1315,26 @@ class Layers:
     def engram(self, layer: int, x: torch.Tensor, w: Weights) -> torch.Tensor:
         """``Engram.forward`` on the stream ``[tokens, hc, dim]``: the layer's table rows at the hash ids,
         projected to one key per copy and a shared value, added through a gate."""
+        self._wait_begin(x.device)
+        self.wait_engram_proj(x.device)
         cfg = self.cfg
         index = cfg.engram_layer_ids.index(layer)
-        held = scales = ids = None
-        if self.group.size == 1:
-            ids = self.step["hashes"][:, index]
-        elif not self.engram_staged.get(self.table, False):
-            assert self.fetched is not None
-            held, scales = self.fetched[0][:, index], self.fetched[1][:, index]
-        out = self.k("ds.engram@1")(index, x, held, scales, ids, w["engram.embed.weight"], w["engram.embed.scale"],
-                                     w["engram.wkv.weight"], w["engram.wkv.scale"], w["engram.wkv.packed"],
-                                     w["engram.q_weight"], w["engram.k_weight"], cfg.rms_norm_eps, True)
+        pre_kv = self.step.pop(("_pre_engram_kv", layer), None)
+        if pre_kv is not None:
+            out = self.k("ds.engram@1")(index, x, None, None, None, w["engram.embed.weight"], w["engram.embed.scale"],
+                                        w["engram.wkv.weight"], w["engram.wkv.scale"], w["engram.wkv.packed"],
+                                        w["engram.q_weight"], w["engram.k_weight"], cfg.rms_norm_eps, True,
+                                        pre_kv=pre_kv)
+        else:
+            held = scales = ids = None
+            if self.group.size == 1:
+                ids = self.step["hashes"][:, index]
+            elif not self.engram_staged.get(self.table, False):
+                assert self.fetched is not None
+                held, scales = self.fetched[0][:, index], self.fetched[1][:, index]
+            out = self.k("ds.engram@1")(index, x, held, scales, ids, w["engram.embed.weight"], w["engram.embed.scale"],
+                                        w["engram.wkv.weight"], w["engram.wkv.scale"], w["engram.wkv.packed"],
+                                        w["engram.q_weight"], w["engram.k_weight"], cfg.rms_norm_eps, True)
         if layer == self._last_engram:
             self.step.pop("hashes", None)
             self.fetched = None
@@ -1225,8 +1346,10 @@ class Layers:
         # Among ranks this rank's stacks hold its part of the layer's experts, where the placement says.
         return self.k("ds.moe@1")(
             self.group, x, w["ffn.gate.weight"], w["ffn.gate.bias"], w["ffn.gate.bf16"],
-            *(w[f"ffn.experts.{m}.{part}"] for m in ("w13", "w2") for part in ("weight", "packed")),
-            *(w[f"ffn.shared_experts.{m}.{part}"] for m in ("w13", "w2") for part in ("weight", "scale", "packed")),
+            w["ffn.experts.w13.weight"], w["ffn.experts.w13.packed"],
+            w["ffn.experts.w2.weight"], w["ffn.experts.w2.packed"],
+            w["ffn.shared_experts.w13.weight"], w["ffn.shared_experts.w13.scale"], w["ffn.shared_experts.w13.packed"],
+            w["ffn.shared_experts.w2.weight"], w["ffn.shared_experts.w2.scale"], w["ffn.shared_experts.w2.packed"],
             cfg.num_experts_per_tok, cfg.routed_scaling_factor, cfg.swiglu_limit, *self.placement.maps(layer),
             self.decode_valid if self.layout is None and x.shape[0] else None)
 
@@ -1242,6 +1365,7 @@ class Layers:
     def idle_fetch(self, weights: Sequence[Weights]) -> None:
         self._sync_flags()
         self.table = "decode"
+        self._active_fns = self._fns_by_table.get(self.table, {})
         if self.cfg.engram_layer_ids:
             device = weights[0]["ffn.gate.weight"].device
             ids = torch.empty(0, len(self.cfg.engram_layer_ids), self.cfg.engram_hash_cols,
@@ -1260,27 +1384,130 @@ class Layers:
         return self.constant("cos_sin.compress" if self.cfg.ratio(layer) else "cos_sin.window", device)
 
     def attention(self, layer: int, x: torch.Tensor, w: Weights,
-                  selected: torch.Tensor | slice | None = None) -> torch.Tensor:
+                  selected: torch.Tensor | slice | None = None,
+                  next_engram: tuple[int, Weights] | None = None) -> torch.Tensor:
         """``Attention.forward`` on a layer's normed input ``[tokens, dim]``."""
+        self._wait_begin(x.device)
         cfg, step = self.cfg, self.step
         heads, dim, rd, eps = cfg.num_attention_heads, cfg.head_dim, cfg.qk_rope_head_dim, cfg.rms_norm_eps
         pos32 = step["pos32"]
         table = self.cos_sin(layer, pos32.device)
         has_iq = layer in cfg.index_source_layer_ids
-        q, kv, iq = self.k("ds.attn_qkv@1")(
-            x, w["attn.wq_a.weight"], w["attn.wq_a.scale"], w["attn.wq_a.packed"],
-            w["attn.wkv.weight"], w["attn.wkv.scale"], w["attn.wkv.packed"], w["attn.q_norm.weight"], eps,
-            w["attn.wq_b.weight"], w["attn.wq_b.scale"], w["attn.wq_b.packed"],
-            w["attn.indexer.wq_b.weight"] if has_iq else None,
-            w["attn.indexer.wq_b.scale"] if has_iq else None,
-            w["attn.indexer.wq_b.packed"] if has_iq else None,
-            heads, dim)
-        ring = self.slots.bind(layer).buffers()["ring"]  # [slots, window, record]: a page a request
+        ring = self._slot_rings.get(layer)
+        if ring is None:
+            ring = self.slots.bind(layer).buffers()["ring"]  # [slots, window, record]: a page a request
         win = cfg.sliding_window
         sink = w["attn.attn_sink"]
         store = self.k("ds.store_cache@1")
         ratio = cfg.ratio(layer)
         if self.layout is None:
+            aux = self._get_aux(x.device)
+            if aux is not None and self.attn_staged.get(self.table, False) and x.shape[0] > 0:
+                main = torch.cuda.current_stream(x.device)
+                ev_fork, ev_join = self._ev_fork, self._ev_join
+                assert ev_fork is not None and ev_join is not None
+                is_kv_src = ratio > 0 and layer == cfg.kv_source(layer)
+                is_idx_src = ratio > 0 and layer == cfg.index_source(layer)
+                kv_norm_w = w["attn.kv_norm.weight"]
+                ring_flat = ring.flatten(0, 1)
+                ring_slot32 = step["ring_slot32"]
+                idx_scale = cfg.index_head_dim ** -0.5 * cfg.index_n_heads ** -0.5
+                if is_kv_src:
+                    kv_pool = self._kv_pools.get(layer) or self.kv.bind(layer).buffers()
+                    entries = self.kv.page_size // ratio
+                    ev_fork.record(main)
+                    aux.wait_event(ev_fork)
+                    x.record_stream(aux)
+                    with torch.cuda.stream(aux):
+                        self._compress(layer, x, w, kv_pool, entries)
+                        if is_idx_src:
+                            raw_w = step.pop(("_pre_idx_weights", layer), None)
+                            if raw_w is None:
+                                raw_w = self.k("ds.linear@1")(x, w["attn.indexer.weights_proj.weight"])
+                            scaled_w = raw_w * idx_scale
+                            scaled_w.record_stream(main)
+                            step[("_pre_idx_scaled", layer)] = scaled_w
+                        ev_join.record(aux)
+                    q, kv, iq = self.k("ds.attn_qkv@1")(
+                        x, w["attn.wq_a.weight"], w["attn.wq_a.scale"], w["attn.wq_a.packed"],
+                        w["attn.wkv.weight"], w["attn.wkv.scale"], w["attn.wkv.packed"], w["attn.q_norm.weight"], eps,
+                        w["attn.wq_b.weight"], w["attn.wq_b.scale"], w["attn.wq_b.packed"],
+                        w["attn.indexer.wq_b.weight"] if has_iq else None,
+                        w["attn.indexer.wq_b.scale"] if has_iq else None,
+                        w["attn.indexer.wq_b.packed"] if has_iq else None,
+                        heads, dim)
+                    store(kv, kv_norm_w, eps, table, pos32, rd, ring_flat, ring_slot32, "fp8", win)
+                    if is_idx_src:
+                        assert iq is not None
+                        q_iq = iq.unflatten(-1, (cfg.index_n_heads, cfg.index_head_dim))
+                        step[("_pre_idx_q", layer)] = self.k("ds.quant_index_q@1")(q_iq, table, pos32, rd)
+                    main.wait_event(ev_join)
+                    latents, chosen = self._compressed(layer, x, iq, w, skip_compress=True)
+                    chosen_cnt = step.get(("chosen_cnt", ratio)) if self.mega_decode_attn.get(self.table, False) else None
+                else:
+                    if is_idx_src:
+                        ev_fork.record(main)
+                        aux.wait_event(ev_fork)
+                        x.record_stream(aux)
+                        with torch.cuda.stream(aux):
+                            raw_w = self.k("ds.linear@1")(x, w["attn.indexer.weights_proj.weight"])
+                            scaled_w = raw_w * idx_scale
+                            scaled_w.record_stream(main)
+                            step[("_pre_idx_scaled", layer)] = scaled_w
+                    do_eng = (not is_idx_src and next_engram is not None
+                              and self.engram_staged.get(self.table, False))
+
+                    def _kv_cb(kv_s: torch.Tensor) -> None:
+                        ev_fork.record(main)
+                        aux.wait_event(ev_fork)
+                        kv_s.record_stream(aux)
+                        with torch.cuda.stream(aux):
+                            store(kv_s, kv_norm_w, eps, table, pos32, rd, ring_flat, ring_slot32, "fp8", win)
+                            ev_join.record(aux)
+                            if do_eng:
+                                assert next_engram is not None and self._ev_engram_join is not None
+                                eng_layer, eng_w = next_engram
+                                eng_idx = cfg.engram_layer_ids.index(eng_layer)
+                                kv_eng = self.k("ds.engram@1")(
+                                    eng_idx, x, None, None, None,
+                                    eng_w["engram.embed.weight"], eng_w["engram.embed.scale"],
+                                    eng_w["engram.wkv.weight"], eng_w["engram.wkv.scale"], eng_w["engram.wkv.packed"],
+                                    eng_w["engram.q_weight"], eng_w["engram.k_weight"], eps, True, proj_only=True)
+                                kv_eng.record_stream(main)
+                                step[("_pre_engram_kv", eng_layer)] = kv_eng
+                                self._ev_engram_join.record(aux)
+                                self._pending_engram_join = True
+
+                    q, kv, iq = self.k("ds.attn_qkv@1")(
+                        x, w["attn.wq_a.weight"], w["attn.wq_a.scale"], w["attn.wq_a.packed"],
+                        w["attn.wkv.weight"], w["attn.wkv.scale"], w["attn.wkv.packed"], w["attn.q_norm.weight"], eps,
+                        w["attn.wq_b.weight"], w["attn.wq_b.scale"], w["attn.wq_b.packed"],
+                        w["attn.indexer.wq_b.weight"] if has_iq else None,
+                        w["attn.indexer.wq_b.scale"] if has_iq else None,
+                        w["attn.indexer.wq_b.packed"] if has_iq else None,
+                        heads, dim, _kv_cb)
+                    if is_idx_src:
+                        assert iq is not None
+                        q_iq = iq.unflatten(-1, (cfg.index_n_heads, cfg.index_head_dim))
+                        step[("_pre_idx_q", layer)] = self.k("ds.quant_index_q@1")(q_iq, table, pos32, rd)
+                    main.wait_event(ev_join)
+                    latents = chosen = chosen_cnt = None
+                    if ratio:
+                        latents, chosen = self._compressed(layer, x, iq, w)
+                        chosen_cnt = step.get(("chosen_cnt", ratio)) if self.mega_decode_attn.get(self.table, False) else None
+                out = self.k("ds.cache_attn_out@1")(
+                    q, table, pos32, rd, ring, step["window"], latents, chosen, sink, dim ** -0.5, cfg.o_groups,
+                    w["attn.wo_a.weight"], w["attn.wo_b.weight"], w["attn.wo_b.scale"], w["attn.wo_b.packed"],
+                    step.get("window_cnt"), chosen_cnt)
+                return out if selected is None else out[selected]
+            q, kv, iq = self.k("ds.attn_qkv@1")(
+                x, w["attn.wq_a.weight"], w["attn.wq_a.scale"], w["attn.wq_a.packed"],
+                w["attn.wkv.weight"], w["attn.wkv.scale"], w["attn.wkv.packed"], w["attn.q_norm.weight"], eps,
+                w["attn.wq_b.weight"], w["attn.wq_b.scale"], w["attn.wq_b.packed"],
+                w["attn.indexer.wq_b.weight"] if has_iq else None,
+                w["attn.indexer.wq_b.scale"] if has_iq else None,
+                w["attn.indexer.wq_b.packed"] if has_iq else None,
+                heads, dim)
             # A decode step attends in the caches: the token's own record goes into the ring first,
             # then its window is the ring's records at the positions up to its own, oldest first.
             store(kv, w["attn.kv_norm.weight"], eps, table, pos32, rd, ring.flatten(0, 1), step["ring_slot32"], "fp8", win)
@@ -1293,6 +1520,14 @@ class Layers:
                 w["attn.wo_a.weight"], w["attn.wo_b.weight"], w["attn.wo_b.scale"], w["attn.wo_b.packed"],
                 step.get("window_cnt"), chosen_cnt)
             return out if selected is None else out[selected]
+        q, kv, iq = self.k("ds.attn_qkv@1")(
+            x, w["attn.wq_a.weight"], w["attn.wq_a.scale"], w["attn.wq_a.packed"],
+            w["attn.wkv.weight"], w["attn.wkv.scale"], w["attn.wkv.packed"], w["attn.q_norm.weight"], eps,
+            w["attn.wq_b.weight"], w["attn.wq_b.scale"], w["attn.wq_b.packed"],
+            w["attn.indexer.wq_b.weight"] if has_iq else None,
+            w["attn.indexer.wq_b.scale"] if has_iq else None,
+            w["attn.indexer.wq_b.packed"] if has_iq else None,
+            heads, dim)
         # A step laid out on the host attends over one source of keys, as DeepInfer's prefill does:
         # the window's earlier keys loaded out of the rings, this step's own, the latents loaded.
         # The ring is read before this step's keys go into it (they may take the same entries).
@@ -1303,7 +1538,7 @@ class Layers:
             from kernels import ds1017_triton as fast_triton
 
             kv_src, idx_src = cfg.kv_source(layer), cfg.index_source(layer)
-            pool = self.kv.bind(kv_src).buffers()
+            pool = self._kv_pools.get(kv_src) or self.kv.bind(kv_src).buffers()
             entries = self.kv.page_size // ratio
             swa_fp8 = step["swa_fp8"]
             swa_flat = swa_fp8.flatten(0, 1)
@@ -1378,7 +1613,7 @@ class Layers:
                     idx[:, :win_cols].copy_(w32)
         else:
             kv_src, idx_src = cfg.kv_source(layer), cfg.index_source(layer)
-            pool = self.kv.bind(kv_src).buffers()
+            pool = self._kv_pools.get(kv_src) or self.kv.bind(kv_src).buffers()
             entries = self.kv.page_size // ratio
             lat = lay.latents[ratio]
             if layer == kv_src:
@@ -1460,8 +1695,8 @@ class Layers:
             step.pop("win_idx32", None)
         return out
 
-    def _compressed(self, layer: int, x: torch.Tensor, iq: torch.Tensor | None, w: Weights
-                    ) -> tuple[torch.Tensor, torch.Tensor]:
+    def _compressed(self, layer: int, x: torch.Tensor, iq: torch.Tensor | None, w: Weights,
+                    *, skip_compress: bool = False) -> tuple[torch.Tensor, torch.Tensor]:
         """``Attention._compress_kv``. A source layer compresses first; an index source chooses, and the
         layers after it take its choice. In a decode step: the source layer's latent cache by its pages
         ``[pages, entries, record]`` and per token its chosen latents as rows of it; in a step laid out
@@ -1469,9 +1704,9 @@ class Layers:
         indices into them. ``-1``: none."""
         cfg, step = self.cfg, self.step
         ratio, source = cfg.ratio(layer), cfg.kv_source(layer)
-        pool = self.kv.bind(source).buffers()
+        pool = self._kv_pools.get(source) or self.kv.bind(source).buffers()
         entries = self.kv.page_size // ratio
-        if layer == source:
+        if layer == source and not skip_compress:
             self._compress(layer, x, w, pool, entries)
         if layer == cfg.index_source(layer):
             assert iq is not None
@@ -1564,12 +1799,18 @@ class Layers:
         cfg, step = self.cfg, self.step
         ratio, rd, h, d = cfg.ratio(layer), cfg.qk_rope_head_dim, cfg.index_n_heads, cfg.index_head_dim
         pos32 = step["pos32"]
-        q = iq.unflatten(-1, (h, d))
-        q_data, q_scales = self.k("ds.quant_index_q@1")(q, self.cos_sin(layer, pos32.device), pos32, rd)
-        raw_w = step.pop(("_pre_idx_weights", layer), None)
-        if raw_w is None:
-            raw_w = self.k("ds.linear@1")(x, w["attn.indexer.weights_proj.weight"])
-        weights = raw_w * (d ** -0.5 * h ** -0.5)
+        pre_q = step.pop(("_pre_idx_q", layer), None)
+        if pre_q is not None:
+            q_data, q_scales = pre_q
+        else:
+            q = iq.unflatten(-1, (h, d))
+            q_data, q_scales = self.k("ds.quant_index_q@1")(q, self.cos_sin(layer, pos32.device), pos32, rd)
+        weights = step.pop(("_pre_idx_scaled", layer), None)
+        if weights is None:
+            raw_w = step.pop(("_pre_idx_weights", layer), None)
+            if raw_w is None:
+                raw_w = self.k("ds.linear@1")(x, w["attn.indexer.weights_proj.weight"])
+            weights = raw_w * (d ** -0.5 * h ** -0.5)
         source, uses = layer == cfg.candidate_source_layer_id, 0 <= cfg.candidate_source_layer_id < layer
         mode = "source" if source else "user" if uses else "dense"
         candidates = step.get("candidates") if uses else None

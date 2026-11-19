@@ -158,7 +158,7 @@ class PyTorchExecutor:
 
     def __init__(self, platform: Any, batch: Any, plans: PlanService, sampler: Any, stores: dict[str, Any],
                  spec: Speculative | None = None, idle: Callable[[], None] | None = None,
-                 stepped: Callable[[], None] | None = None) -> None:
+                 stepped: Callable[[], None] | None = None, model: Any = None) -> None:
         self.platform, self.batch, self.plans, self.sampler, self.stores = platform, batch, plans, sampler, stores
         self.spec = spec
         """Speculation (doc/specs/mtp.md); ``None`` off."""
@@ -166,12 +166,17 @@ class PyTorchExecutor:
         """The model's part in a step this rank has no rows in (``model.idle``); ``None``: none."""
         self.stepped = stepped
         """What the model does after each forward, outside any graph (``model.stepped``); ``None``: nothing."""
+        self.model = model
+        """Optional model reference for vocab-parallel greedy LM head (``vp_head_ready``)."""
         self.last_end: Mark | None = None
         """The end of the device work of the step submitted last."""
         self.row_index: torch.Tensor | None = None
         """``0 .. n - 1`` on the device, as long as the largest decode step so far."""
         self._dec_h2d_pin: torch.Tensor | None = None
         self._dec_h2d_dev: torch.Tensor | None = None
+        self._dec_pos_pin: torch.Tensor | None = None
+        self._dec_rows_key: tuple[int, ...] | None = None
+        self._dec_rows_dev: torch.Tensor | None = None
         self._pref_tok_pin: torch.Tensor | None = None
         self._d2h_ring: torch.Tensor | None = None
         self._event_ring: list[torch.cuda.Event] = []
@@ -283,15 +288,44 @@ class PyTorchExecutor:
                         or self._dec_h2d_dev.device != device or self._dec_h2d_pin.shape[2] < n_rows):
                     self._dec_h2d_pin = torch.empty((8, 2, cap), dtype=torch.int64, pin_memory=True)
                     self._dec_h2d_dev = torch.empty((2, cap), dtype=torch.int64, device=device)
-                pin_slot = self._dec_h2d_pin[epoch & 7][:, :n_rows]
-                pin_slot.copy_(torch.tensor([[r + 1 for r in rows], positions], dtype=torch.int64))
-                dev_slot = self._dec_h2d_dev[:, :n_rows]
-                dev_slot.copy_(pin_slot, non_blocking=True)
-                rows_dev_cached, pos = dev_slot[0], dev_slot[1]
+                    self._dec_pos_pin = torch.empty((8, cap), dtype=torch.int64, pin_memory=True)
+                    self._dec_rows_key = None
+                    self._dec_rows_dev = None
+                chosen_in = getattr(chosen, "inputs", None)
+                chosen_pos = getattr(chosen, "positions", None)
+                rows_key = tuple(rows)
+                if (chosen_in is not None and chosen_pos is not None
+                        and int(getattr(chosen, "size", 0)) >= n_rows):
+                    if (self._dec_rows_key == rows_key and self._dec_rows_dev is not None
+                            and self._dec_rows_dev.device == device):
+                        rows_dev_cached = self._dec_rows_dev
+                        assert self._dec_pos_pin is not None
+                        pos_pin = self._dec_pos_pin[epoch & 7][:n_rows]
+                        pos_pin.copy_(torch.tensor(positions, dtype=torch.int64))
+                        chosen_pos[:n_rows].copy_(pos_pin, non_blocking=True)
+                    else:
+                        pin_slot = self._dec_h2d_pin[epoch & 7][:, :n_rows]
+                        pin_slot.copy_(torch.tensor([[r + 1 for r in rows], positions], dtype=torch.int64))
+                        rows_dev_cached = self._dec_h2d_dev[0, :n_rows]
+                        rows_dev_cached.copy_(pin_slot[0], non_blocking=True)
+                        chosen_pos[:n_rows].copy_(pin_slot[1], non_blocking=True)
+                        self._dec_rows_key = rows_key
+                        self._dec_rows_dev = rows_dev_cached
+                    torch.index_select(last_token, 0, rows_dev_cached, out=chosen_in[:n_rows])
+                    input_ids, pos = chosen_in[:n_rows], chosen_pos[:n_rows]
+                else:
+                    pin_slot = self._dec_h2d_pin[epoch & 7][:, :n_rows]
+                    pin_slot.copy_(torch.tensor([[r + 1 for r in rows], positions], dtype=torch.int64))
+                    dev_slot = self._dec_h2d_dev[:, :n_rows]
+                    dev_slot.copy_(pin_slot, non_blocking=True)
+                    rows_dev_cached, pos = dev_slot[0], dev_slot[1]
+                    self._dec_rows_key = rows_key
+                    self._dec_rows_dev = rows_dev_cached
+                    input_ids = last_token[rows_dev_cached]
             else:
                 rows_dev_cached = on_device(torch.tensor([r + 1 for r in rows], dtype=torch.int64), device)
                 pos = on_device(torch.tensor(positions, dtype=torch.int64), device)
-            input_ids = last_token[rows_dev_cached]
+                input_ids = last_token[rows_dev_cached]
         else:
             n_tok = len(plan.tokens)
             if n_tok == 0:
@@ -346,12 +380,65 @@ class PyTorchExecutor:
             last_index = on_device(last, device)
 
         counts: torch.Tensor | None = None
+        uva_tokens: torch.Tensor | None = None
+        use_vp = (self.spec is None and self.model is not None
+                  and bool(getattr(self.model, "vp_head_ready", False)))
         if self.spec is not None and plan.phase == "decode":
             next_token_ids, _, done = self.spec.decode(plan, rows, positions, input_ids,
                                                             self.batch.track("gdn.slots"))
             counts, logits = done.lengths, next_token_ids
         elif self.spec is not None:
             next_token_ids, logits = self.spec.prefill(plan, rows, num_tokens, positions, input_ids, pos, last_index)
+        elif use_vp:
+            assert self.model is not None
+            if getattr(chosen, "splits_head", False):
+                try:
+                    hidden = chosen.run(self.batch, plan, input_ids, pos, last_index)
+                except StaleGraph:
+                    if chosen is eager or self.plans.required:
+                        raise
+                    hidden = getattr(eager, "run_backbone")(self.batch, plan, input_ids, pos, last_index)
+            else:
+                hidden = getattr(eager, "run_backbone")(self.batch, plan, input_ids, pos, last_index)
+            if self.stepped is not None:
+                self.stepped()
+            sample_rows = rows if sample_at is None else [rows[i] for i in sample_at]
+            sample_pos = pos if plan.phase == "decode" else pos[last_index]
+            if sample_rows:
+                params = self.batch.sampling(sample_rows)
+                force_topk = int(getattr(self.sampler, "force_topk", 0))
+                vp_cap = int(getattr(self.model, "vp_head_cap", 0))
+                all_greedy = (force_topk == 0 and len(sample_rows) <= vp_cap
+                              and all(0 <= p.temperature < 1e-6 or p.top_k == 1 for p in params))
+                if all_greedy:
+                    n_out = len(sample_rows)
+                    cap_out = max(n_out, int(getattr(self.batch, "max_rows", n_out)), 128)
+                    if (self._d2h_ring is None or self._d2h_ring.dtype != torch.int32
+                            or self._d2h_ring.shape[1] < n_out):
+                        self._d2h_ring = torch.empty((8, cap_out), dtype=torch.int32, pin_memory=True)
+                    uva_tokens = self._d2h_ring[epoch & 7][:n_out]
+                    rp = (rows_dev_cached if (sample_at is None and rows_dev_cached is not None)
+                          else on_device(torch.tensor([r + 1 for r in sample_rows], dtype=torch.int64), device))
+                    next_token_ids = self.model.vp_head_step(
+                        hidden, out_host_uva=uva_tokens, last_token=last_token, rows_plus1=rp)
+                    if hasattr(self.batch, "mark_recorded"):
+                        self.batch.mark_recorded(sample_rows)
+                    else:
+                        for r in sample_rows:
+                            self.batch.rows[r].has_previous = True
+                    logits = torch.empty(0, dtype=torch.float32, device=device)
+                else:
+                    self.model.vp_head_step(None)
+                    logits = self.model.lm_head(hidden)
+                    next_token_ids = self.sampler.sample(logits, params, sample_pos)
+                    if sample_at is None and rows_dev_cached is not None and hasattr(self.batch, "record_dev"):
+                        self.batch.record_dev(sample_rows, rows_dev_cached, next_token_ids)
+                    else:
+                        self.batch.record(sample_rows, next_token_ids)
+            else:
+                self.model.vp_head_step(None)
+                next_token_ids = torch.empty(0, dtype=torch.int32, device=device)
+                logits = torch.empty(0, dtype=torch.float32, device=device)
         else:
             try:
                 logits = chosen.run(self.batch, plan, input_ids, pos, last_index)
@@ -371,19 +458,22 @@ class PyTorchExecutor:
                     self.batch.record(sample_rows, next_token_ids)
             else:
                 next_token_ids = torch.empty(0, dtype=torch.int32, device=device)
-        tokens = next_token_ids
-        if device.type == "cuda":  # async_d2h: into pinned memory, without waiting for the device
-            if counts is None and next_token_ids.ndim == 1:
-                n_out = next_token_ids.shape[0]
-                cap_out = max(n_out, int(getattr(self.batch, "max_rows", n_out)), 128)
-                if (self._d2h_ring is None or self._d2h_ring.dtype != next_token_ids.dtype
-                        or self._d2h_ring.shape[1] < n_out):
-                    self._d2h_ring = torch.empty((8, cap_out), dtype=next_token_ids.dtype, pin_memory=True)
-                tokens = self._d2h_ring[epoch & 7][:n_out]
-                tokens.copy_(next_token_ids, non_blocking=True)
-            else:
-                tokens = torch.empty(next_token_ids.shape, dtype=next_token_ids.dtype, pin_memory=True)
-                tokens.copy_(next_token_ids, non_blocking=True)
+        if uva_tokens is not None:
+            tokens = uva_tokens
+        else:
+            tokens = next_token_ids
+            if device.type == "cuda":  # async_d2h: into pinned memory, without waiting for the device
+                if counts is None and next_token_ids.ndim == 1:
+                    n_out = next_token_ids.shape[0]
+                    cap_out = max(n_out, int(getattr(self.batch, "max_rows", n_out)), 128)
+                    if (self._d2h_ring is None or self._d2h_ring.dtype != next_token_ids.dtype
+                            or self._d2h_ring.shape[1] < n_out):
+                        self._d2h_ring = torch.empty((8, cap_out), dtype=next_token_ids.dtype, pin_memory=True)
+                    tokens = self._d2h_ring[epoch & 7][:n_out]
+                    tokens.copy_(next_token_ids, non_blocking=True)
+                else:
+                    tokens = torch.empty(next_token_ids.shape, dtype=next_token_ids.dtype, pin_memory=True)
+                    tokens.copy_(next_token_ids, non_blocking=True)
         self._copies(state, "after")
         end, previous = self._mark(device), self.last_end
         self.last_end = end
@@ -427,4 +517,5 @@ class Unit:
                 eager_idle()
 
         ctx.provide("executor@1", PyTorchExecutor(ctx.platform, batch, plans, sampler, stores, spec,
-                                                  idle if eager_idle is not None else None, getattr(model, "stepped", None)))
+                                                  idle if eager_idle is not None else None,
+                                                  getattr(model, "stepped", None), model))

@@ -98,6 +98,15 @@ class Mega:
         self.engram_hooks: list[Any] = []
         self._id_hc: tuple[int, int, torch.device, torch.Tensor, torch.Tensor, torch.Tensor] | None = None
         self._cache: dict[tuple[Any, ...], tuple[tuple[int, ...], Any]] = {}
+        self._fast_cache: dict[
+            tuple[Any, ...],
+            tuple[tuple[torch.Tensor, ...], tuple[torch.Tensor, ...], tuple[int, ...], Any],
+        ] = {}
+        self._packed_cache: dict[
+            tuple[int, int, int, torch.dtype],
+            tuple[torch.Tensor, torch.Tensor, tuple[torch.Tensor, torch.Tensor]],
+        ] = {}
+        self._symm_fast: tuple[Any, ...] = ()
         self._block_m_memo: dict[tuple[int, int, int, int, int], int] = {}
         self._win_memo: tuple[torch.Tensor, int, torch.Tensor, torch.Tensor] | None = None
         self._lat_memo: dict[int, tuple[torch.Tensor, int, torch.Tensor, torch.Tensor]] = {}
@@ -124,17 +133,42 @@ class Mega:
 
     def _cached(self, tag: str, bases: Sequence[torch.Tensor], extra: tuple[Any, ...],
                 build: Callable[[], Any]) -> Any:
-        roots = [_base(t) for t in bases]
-        key = (tag, *(r.data_ptr() for r in roots), *extra)
-        versions = tuple(r._version for r in roots)
+        fkey = (tag, *(id(t) for t in bases), *extra)
+        fhit = self._fast_cache.get(fkey)
+        if fhit is not None:
+            orig, roots, vers, value = fhit
+            if (len(orig) == len(bases)
+                    and all(a is b for a, b in zip(bases, orig))
+                    and all(r._version == v for r, v in zip(roots, vers))):
+                return value
+        roots_t = tuple(_base(t) for t in bases)
+        key = (tag, *(r.data_ptr() for r in roots_t), *extra)
+        versions = tuple(r._version for r in roots_t)
         hit = self._cache.get(key)
         if hit is not None and hit[0] == versions:
-            return hit[1]
-        with torch.inference_mode(False):
-            value = build()
-        self._cache[key] = (versions, value)
-        weakref.finalize(roots[0], self._cache.pop, key, None)
+            value = hit[1]
+        else:
+            with torch.inference_mode(False):
+                value = build()
+            self._cache[key] = (versions, value)
+            weakref.finalize(roots_t[0], self._cache.pop, key, None)
+        orig_t = tuple(bases)
+        self._fast_cache[fkey] = (orig_t, roots_t, versions, value)
+        weakref.finalize(orig_t[0], self._fast_cache.pop, fkey, None)
         return value
+
+    def _packed_view(self, w: torch.Tensor, p: torch.Tensor, rows: int, dtype: torch.dtype
+                     ) -> tuple[torch.Tensor, torch.Tensor]:
+        key = (id(w), id(p), rows, dtype)
+        hit = self._packed_cache.get(key)
+        if hit is not None and hit[0] is w and hit[1] is p:
+            return hit[2]
+        with torch.inference_mode(False):
+            pair = (w.view(dtype), packed_words(p, rows))
+        self._packed_cache[key] = (w, p, pair)
+        weakref.finalize(w, self._packed_cache.pop, key, None)
+        weakref.finalize(p, self._packed_cache.pop, key, None)
+        return pair
 
     def linear(self, x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
         if x.dtype != BF16 or weight.dtype != torch.float32:
@@ -165,8 +199,12 @@ class Mega:
             self.buffer.destroy()
         self.buffer = None
         self.made_for = ()
+        self._symm_fast = ()
 
     def symm(self, group: Any, experts: int, topk: int, hidden: int, inter: int) -> Any:
+        fast_key = (group, experts, topk, hidden, inter)
+        if self.buffer is not None and self._symm_fast == fast_key:
+            return self.buffer
         pg = group.device_group if group.size > 1 else None
         made_for: tuple[int, ...] = (id(pg) if pg is not None else 0, int(group.size), experts, topk, hidden, inter)
         if self.buffer is not None and made_for != self.made_for:
@@ -181,6 +219,7 @@ class Mega:
                     entry[0] += 1
                     self.buffer = entry[1]
                     self.made_for = made_for
+                    self._symm_fast = fast_key
                     return self.buffer
             # DeepGEMM finds which SMs sit together once, and waits for the device doing it: here, not
             # in a step that is being recorded.
@@ -195,6 +234,7 @@ class Mega:
                 sys.__dict__.setdefault("_agx_symm_buf_pool", {})[made_for] = [1, buf]
             self.buffer = buf
             self.made_for = made_for
+        self._symm_fast = fast_key
         return self.buffer
 
     def hc_step(self, x: torch.Tensor | None, residual: torch.Tensor, pre: torch.Tensor, post: torch.Tensor | None,
@@ -339,7 +379,8 @@ class Mega:
     def attn_qkv(self, x: torch.Tensor, wq_a: torch.Tensor, sq_a: torch.Tensor, pq_a: torch.Tensor,
                  wkv: torch.Tensor, skv: torch.Tensor, pkv: torch.Tensor, q_norm: torch.Tensor, eps: float,
                  wq_b: torch.Tensor, sq_b: torch.Tensor, pq_b: torch.Tensor, iwq_b: torch.Tensor | None,
-                 isq_b: torch.Tensor | None, ipq_b: torch.Tensor | None, heads: int, head_dim: int
+                 isq_b: torch.Tensor | None, ipq_b: torch.Tensor | None, heads: int, head_dim: int,
+                 kv_cb: Callable[[torch.Tensor], None] | None = None
                  ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
         """``ds.attn_qkv@1`` as ``DeepseekV41Attention``: merged ``[wq_a; wkv]`` on the staged FP8 input
         from ``hc_step``, ``norm_forward_and_per_token_cast`` for ``q_norm``, and merged
@@ -357,6 +398,9 @@ class Mega:
         w_qkv = self._qkv_weights(wq_a, pq_a, wkv, pkv)
         qkv = ops._out(tokens, q_lora + kv_dim, BF16, device)
         deep_gemm.fp8_fp4_gemm_nt(x_fp8, w_qkv, qkv, None, recipe=(1, 1, BLOCK))
+        kv_out = qkv[:, q_lora:]
+        if kv_cb is not None:
+            kv_cb(kv_out)
         qr = qkv[:, :q_lora]
         if qr.stride(-1) != 1 or qr.stride(0) % 16 != 0:
             qr = qr.contiguous()
@@ -365,14 +409,14 @@ class Mega:
         qr_fp8 = tile_kernels.quant.norm_forward_and_per_token_cast(
             qr, qn_bf16, eps, fmt="e4m3",
             num_per_channels=BLOCK, round_sf=True, use_packed_ue8m0=True, use_tma_aligned_col_major_sf=True)[0]
-        w_qb = self._qb_weights(wq_b, pq_b, iwq_b, ipq_b, heads, head_dim)
         q_cols = heads * head_dim
+        w_qb = self._qb_weights(wq_b, pq_b, iwq_b, ipq_b, heads, head_dim)
         extra_cols = 0 if iwq_b is None else iwq_b.shape[0]
         qb_out = ops._out(tokens, q_cols + extra_cols, BF16, device)
         deep_gemm.fp8_fp4_gemm_nt(qr_fp8, w_qb, qb_out, None, recipe=(1, 1, BLOCK))
         q = qb_out[:, :q_cols].unflatten(-1, (heads, head_dim))
         iq = None if iwq_b is None else qb_out[:, q_cols:]
-        return q, qkv[:, q_lora:], iq
+        return q, kv_out, iq
 
     def _wo(self, ctx_fp8: torch.Tensor, ctx_sf: torch.Tensor, groups: int, heads: int, head_dim: int,
             wo_a: torch.Tensor, wo_b: torch.Tensor, po_b: torch.Tensor) -> torch.Tensor:
@@ -387,7 +431,7 @@ class Mega:
         deep_gemm.fp8_einsum("bhr,hdr->bhd", (ctx_fp8, ctx_sf), wv, (wv_fp8, wv_sf), recipe=(1, 1, BLOCK))
         out = ops._out(tokens, hidden, BF16, device)
         deep_gemm.fp8_fp4_gemm_nt((wv_fp8.flatten(1, 2), wv_sf),
-                                  (wo_b.view(E4M3), packed_words(po_b, hidden)), out, None, recipe=(1, 1, BLOCK))
+                                  self._packed_view(wo_b, po_b, hidden, E4M3), out, None, recipe=(1, 1, BLOCK))
         return out
 
     def cache_attn_out(self, q: torch.Tensor, cos_sin: torch.Tensor, positions: torch.Tensor, rotary: int,
@@ -494,9 +538,9 @@ class Mega:
         self.staged = -1
         out = torch.empty(tokens, hidden, dtype=BF16, device=x.device)
         deep_gemm.fp8_fp4_mega_moe(
-            out, (w13.view(torch.int8), packed_words(p13, 2 * inter)), (w2.view(torch.int8), packed_words(p2, hidden)), symm,
-            shared_l1_weights=(sw13.view(E4M3), packed_words(sp13, 2 * inter)),
-            shared_l2_weights=(sw2.view(E4M3), packed_words(sp2, hidden)), cumulative_local_expert_recv_stats=taken,
+            out, self._packed_view(w13, p13, 2 * inter, torch.int8), self._packed_view(w2, p2, hidden, torch.int8), symm,
+            shared_l1_weights=self._packed_view(sw13, sp13, 2 * inter, E4M3),
+            shared_l2_weights=self._packed_view(sw2, sp2, hidden, E4M3), cumulative_local_expert_recv_stats=taken,
             activation="swiglu", activation_clamp=limit if limit > 0 else None, fast_math=True)
         return out
 
@@ -664,32 +708,39 @@ class Mega:
                ids: torch.Tensor | None, embed_weight: torch.Tensor, embed_scale: torch.Tensor,
                wkv_w: torch.Tensor, wkv_s: torch.Tensor, wkv_p: torch.Tensor,
                q_weight: torch.Tensor, k_weight: torch.Tensor, eps: float,
-               inplace: bool = False) -> torch.Tensor:
+               inplace: bool = False, *, proj_only: bool = False, pre_kv: torch.Tensor | None = None
+               ) -> torch.Tensor:
         """``ds.engram@1``: direct ``fp8_fp4_gemm_nt`` on the FP8 rows (from ``engram_hooks[index]`` or
         local FP8 tables) + cached ``fused_weight`` + ``engram_gate_fwd``."""
-        tokens, hc, dim = x.shape
+        tokens = x.shape[0]
         if not tokens:
-            if index + 1 >= len(self.engram_hooks):
+            if pre_kv is None and index + 1 >= len(self.engram_hooks):
                 self.engram_hooks = []
-            return x.clone()
-        if held is None and scales is None and ids is None:
-            act = self.engram_hooks[index]()
-            if index + 1 >= len(self.engram_hooks):
-                self.engram_hooks = []
+            return torch.empty(0, wkv_w.shape[0], dtype=BF16, device=x.device) if proj_only else x.clone()
+        if pre_kv is not None:
+            kv = pre_kv
         else:
-            if held is None or scales is None:
-                assert ids is not None
-                held, scales = embed_weight[ids], embed_scale[ids]
-            a_fp8 = held.flatten(1).contiguous().view(E4M3)
-            sf_rm = scales.flatten(1).contiguous().view(torch.int32)
-            m_pad = deep_gemm.get_tma_aligned_size(tokens, 4)
-            a_sf = torch.empty(sf_rm.shape[1], m_pad, dtype=torch.int32, device=x.device)
-            a_sf[:, :tokens].copy_(sf_rm.T)
-            act = (a_fp8, a_sf.mT[:tokens])
-        out_cols = wkv_w.shape[0]
-        kv = ops._out(tokens, out_cols, BF16, x.device)
-        deep_gemm.fp8_fp4_gemm_nt(act, (wkv_w.view(E4M3), packed_words(wkv_p, out_cols)), kv, None,
-                                  recipe=(1, 1, BLOCK))
+            if held is None and scales is None and ids is None:
+                act = self.engram_hooks[index]()
+                if index + 1 >= len(self.engram_hooks):
+                    self.engram_hooks = []
+            else:
+                if held is None or scales is None:
+                    assert ids is not None
+                    held, scales = embed_weight[ids], embed_scale[ids]
+                a_fp8 = held.flatten(1).contiguous().view(E4M3)
+                sf_rm = scales.flatten(1).contiguous().view(torch.int32)
+                m_pad = deep_gemm.get_tma_aligned_size(tokens, 4)
+                a_sf = torch.empty(sf_rm.shape[1], m_pad, dtype=torch.int32, device=x.device)
+                a_sf[:, :tokens].copy_(sf_rm.T)
+                act = (a_fp8, a_sf.mT[:tokens])
+            out_cols = wkv_w.shape[0]
+            kv = ops._out(tokens, out_cols, BF16, x.device)
+            deep_gemm.fp8_fp4_gemm_nt(act, self._packed_view(wkv_w, wkv_p, out_cols, E4M3), kv, None,
+                                      recipe=(1, 1, BLOCK))
+            if proj_only:
+                return kv
+        hc, dim = x.shape[1], x.shape[2]
         fused = self._engram_weight(q_weight, k_weight)
         x_in = x if x.is_contiguous() else x.contiguous()
         kv_in = (kv if kv.is_contiguous() else kv.contiguous()).view(tokens, hc + 1, dim)
@@ -704,6 +755,9 @@ class Mega:
         self._lat_memo.clear()
         self._sparse_memo.clear()
         self._cache.clear()
+        self._fast_cache.clear()
+        self._packed_cache.clear()
+        self._symm_fast = ()
         if self.nvlink_engram_buf is not None:
             self.nvlink_engram_buf.close()
             self.nvlink_engram_buf = None

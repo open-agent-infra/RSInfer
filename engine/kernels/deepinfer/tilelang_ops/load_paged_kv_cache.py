@@ -6,6 +6,8 @@
 From ``deepinfer/model_executor/layers/tilelang_ops/load_paged_kv_cache.py`` of DeepInfer ``a679bb8`` (LICENSE.deepinfer
 in this directory), without its tests and torch reference; the kernel is imported from ``cuda/``."""
 
+import functools
+
 import torch
 
 from kernels.deepinfer.tilelang_ops.cache_common import (
@@ -20,6 +22,11 @@ from kernels.deepinfer.tilelang_ops.cache_common import (
 )
 from kernels.deepinfer.tilelang_ops.cuda.load_paged_kv_cache import load_paged_kv_cache_tl
 from kernels.deepinfer.tilelang_ops.platform import PLATFORM
+
+
+@functools.lru_cache(maxsize=64)
+def _cached_load_tl(layout: KVCacheFormat, block_size: int, kw: tuple) -> object:
+    return load_paged_kv_cache_tl(layout, block_size, **dict(kw))
 
 
 def load_paged_kv_cache(
@@ -100,6 +107,6 @@ def load_paged_kv_cache(
         mostly_full_pages = total_k * 4 >= load_segments.shape[0] * block_size * 3
         if total_k >= 16384 and mostly_full_pages:
             kernel_kwargs["index_batch_size"] = 4
-    load_kernel = load_paged_kv_cache_tl(layout, block_size, **kernel_kwargs)
+    load_kernel = _cached_load_tl(layout, block_size, tuple(kernel_kwargs.items()) if kernel_kwargs else ())
     load_kernel(load_segments, kv, kv_sf, cache_value, cache_sf)
     return result

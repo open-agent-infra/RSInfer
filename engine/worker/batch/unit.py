@@ -300,6 +300,10 @@ class PersistentBatch:
         for r in rows:
             self.rows[r].has_previous = True
 
+    def mark_recorded(self, rows: Sequence[int]) -> None:
+        for r in rows:
+            self.rows[r].has_previous = True
+
     def invalidate(self) -> None:
         """A step failed after ``apply`` changed the batch: what it holds no longer matches what the
         scheduler thinks it does (rows added, their last tokens not recorded). Until a full delta

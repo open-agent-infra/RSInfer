@@ -12,7 +12,8 @@ services = ["state.weights@1", "state.holder@1", "state.kv.paged@1", "state.swa.
             "layers.ds1017@1", "comm.group@1", "expert.placement@1"]
 
 [reads]
-config = ["model.path", "model.hf_config", "model.dtype", "state.kv.page_size", "weights.path", "dsv4.backend", "deepinfer.nvlink_engram"]
+config = ["model.path", "model.hf_config", "model.dtype", "state.kv.page_size", "weights.path", "dsv4.backend", "deepinfer.nvlink_engram", "batch.max_rows", "sampler.force_topk"]
 
 [config]
 "dsv4.graph_idle_experts" = { type = "bool", default = false, binding = "startup", doc = "Replay graph-captured EP expert participation on ranks with no local rows." }
+"dsv4.vp_head" = { type = "bool", default = true, binding = "startup", doc = "Use NVLink5 vocab-parallel greedy LM head + fused Split-K argmax across ranks." }

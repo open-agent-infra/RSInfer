@@ -116,6 +116,8 @@ class GraphPlan:
         self.last_index = torch.arange(size, device=device)
         self.output: torch.Tensor | None = None
         self.graph: Any = None
+        self._dirty_from = size
+        self.splits_head = False
 
     def run(self, batch: PersistentBatch, plan: BatchPlan, input_ids: Tensor, positions: Tensor,
             last_index: Tensor) -> Tensor:
@@ -125,11 +127,14 @@ class GraphPlan:
             raise ValueError("a decode graph runs one token per row, at most its bucket of rows")
         for backend in self.backends:
             backend.prepare(batch, plan, PlanKey("decode", self.size))
-        self.inputs[:n].copy_(input_ids)
-        self.positions[:n].copy_(positions)
-        if n < self.size:
-            self.inputs[n:].zero_()
-            self.positions[n:].zero_()
+        if input_ids.data_ptr() != self.inputs.data_ptr():
+            self.inputs[:n].copy_(input_ids)
+        if positions.data_ptr() != self.positions.data_ptr():
+            self.positions[:n].copy_(positions)
+        if n < self._dirty_from:
+            self.inputs[n:self._dirty_from].zero_()
+            self.positions[n:self._dirty_from].zero_()
+        self._dirty_from = n
         fetch(self.backends, self.inputs, self.positions)
         self.graph.replay()
         assert self.output is not None
@@ -139,6 +144,8 @@ class GraphPlan:
         if self.graph is not None:
             self.graph.close()
         self.graph, self.output = None, None
+        self._dirty_from = self.size
+        self.splits_head = False
 
     def padded(self, batch: PersistentBatch, model: Any, stores: Sequence[Any]) -> torch.Tensor:
         """An eager forward of the bucket with the padding row in its first lane, from a cleared
@@ -149,20 +156,25 @@ class GraphPlan:
         for backend in self.backends:
             backend.prepare(batch, padding_row(), PlanKey("decode", self.size))
         fetch(self.backends, self.inputs, self.positions)
+        forward = model.forward_backbone if getattr(model, "vp_head_ready", False) else model.forward
         with torch.inference_mode():
-            return model.forward(self.inputs, self.positions, self.last_index)
+            return forward(self.inputs, self.positions, self.last_index)
 
     def capture(self, batch: PersistentBatch, model: Any, stores: Sequence[Any], recorder: Any) -> None:
         """Record the bucket's forward, after an eager one as the warm-up. A graph of one lane has
         no padded lane beside the padding row, so what it replays is defined: it must be the
         logits the same kernels gave eagerly."""
+        split = bool(getattr(model, "vp_head_ready", False))
+        forward = model.forward_backbone if split else model.forward
         with recorder.warmup():
             expected = self.padded(batch, model, stores).clone()
             for store in stores:
                 store.clear(store.scratch())
         with torch.inference_mode(), recorder.capture() as graph:
-            self.output = model.forward(self.inputs, self.positions, self.last_index)
+            self.output = forward(self.inputs, self.positions, self.last_index)
         self.graph = graph
+        self.splits_head = split
+        self._dirty_from = self.size
         with recorder.warmup():
             graph.replay()
         assert self.output is not None

@@ -133,7 +133,7 @@ class Unit:
         from kernels.deepinfer import sampling
         ctx.register("kernels.catalog@1", Implementation(
             Solution("deepinfer.sample.seeded@1", "sample.seeded@1", "kernels.deepinfer.sampling:CachedSampler.sample",
-                     library=library("triton"), shapes={"vocab": [1024]}, capturable=False,
+                     library=library("triton"), shapes={}, capturable=False,
                      requires=["cuda", "sm_100"]), sampling.CachedSampler().sample), label="fused stateless sampling")
 
         ctx.register("kernels.catalog@1", Implementation(

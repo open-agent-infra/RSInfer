@@ -18,6 +18,7 @@ accept_config = true
 "dsv4.yoco_mode" = { type = "str", default = "off", binding = "startup", doc = "Decoder SWA bounded replay: off, compact (keep suffix rows), mask (full rows with the same bounded visibility, for verification)." }
 "dsv4.yoco_keep_tokens" = { type = "int", default = 140, binding = "startup", doc = "Prompt suffix kept in decoder layers, at least sliding_window + 1 without speculation." }
 "dsv4.yoco_paged_consumer" = { type = "bool", default = true, binding = "live", doc = "Attend directly over paged FP4 latents and compact FP8 window records in YoCo compact decoder layers." }
+"dsv4.decode_overlap" = { type = "bool", default = true, binding = "startup", doc = "Overlap independent decode auxiliary ops (KV store, compression, indexer weights, Engram projection) on a second CUDA stream inside decode graphs." }
 "dsv4.backend" = { type = "str", default = "auto", binding = "startup", doc = "DS 1017's layer kernels: auto, or a backend of the kernel catalog, e.g. reference or tilelang" }
 "dsv4.prefill_backend" = { type = "str", default = "", binding = "startup", doc = "For prefill and mixed steps; empty: dsv4.backend" }
 "dsv4.decode_backend" = { type = "str", default = "", binding = "startup", doc = "For decode steps; empty: dsv4.backend" }

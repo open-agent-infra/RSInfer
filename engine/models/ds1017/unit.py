@@ -24,6 +24,7 @@ import json
 import math
 import os
 import re
+import sys
 from collections.abc import Iterable, Mapping
 from types import MappingProxyType
 from typing import Any
@@ -137,14 +138,20 @@ class DeepseekV41ForCausalLM:
     """``model@1``."""
 
     def __init__(self, cfg: DSConfig, dtype: str, page_size: int, services: Mapping[str, Any],
-                 *, symmetric_engram: bool = False, graph_idle: bool = False) -> None:
+                 *, symmetric_engram: bool = False, graph_idle: bool = False,
+                 max_rows: int = 32, vp_head_enabled: bool = True) -> None:
         if dtype != "bf16":
             raise ValueError(f"model.dtype = {dtype!r}: DS 1017's activations are bf16 (its kernels quantize from it)")
         self.cfg, self._dtype = cfg, dtype
         self.symmetric_engram = symmetric_engram
         self.graph_idle = graph_idle
+        self.max_rows = max_rows
+        self._vp_head_cfg = vp_head_enabled
+        self._vp_head: Any = None
+        self._vp_head_failed = False
         s = services
-        self.ranks, self.rank = s["comm.group@1"].size, s["comm.group@1"].rank
+        self._comm_group = s["comm.group@1"]
+        self.ranks, self.rank = self._comm_group.size, self._comm_group.rank
         """The ranks that hold the model between them, and which of them this is."""
         if cfg.n_routed_experts % self.ranks:
             raise ValueError(f"comm.size = {self.ranks} does not divide the {cfg.n_routed_experts} routed experts")
@@ -224,6 +231,9 @@ class DeepseekV41ForCausalLM:
 
     def close(self) -> None:
         """Drop cached views of the weight store and hooks into long-lived services on unload."""
+        if self._vp_head is not None:
+            self._vp_head.close()
+            self._vp_head = None
         self._cached = ((-1, -1), [])
         self._views.clear()
         self.placement.stacks = None
@@ -388,11 +398,87 @@ class DeepseekV41ForCausalLM:
 
     # -------------------------------------------------------------- forward
 
+    @property
+    def vp_head_ready(self) -> bool:
+        return self._vp_head is not None
+
+    @property
+    def vp_head_cap(self) -> int:
+        return int(self._vp_head.cap_per_rank) if self._vp_head is not None else 0
+
+    def prepare_vp_head(self) -> bool:
+        """Initialize NVLink5 vocab-parallel greedy LM head in lockstep across all ranks."""
+        if self._vp_head is not None:
+            return True
+        if (not self._vp_head_cfg or self._vp_head_failed or not (1 < self.ranks <= 8)
+                or self._comm_group.device_group is None or not self.symmetric_engram
+                or self.max_rows < 1 or self.cfg.hidden_size % 8 != 0
+                or self.cfg.vocab_size % self.ranks != 0
+                or (self.cfg.vocab_size // self.ranks) % 16 != 0):
+            return False
+        if not self.layers.mega_experts():
+            return False
+        weights = self._layer_weights()
+        head_w = weights[self.cfg.num_hidden_layers]["head.weight"]
+        if not head_w.is_cuda:
+            return False
+        import torch.distributed as dist
+
+        pg = self._comm_group.device_group
+        cap = min(16, self.max_rows)
+        ok = 1
+        head: Any = None
+        try:
+            from kernels.ds1017_nvlink_head import NvlinkVocabHead
+
+            head = NvlinkVocabHead(self._comm_group, self.cfg.vocab_size, self.cfg.hidden_size,
+                                   cap, head_w.device)
+            if not head.supports_weight(head_w):
+                ok = 0
+        except Exception as exc:  # noqa: BLE001
+            ok = 0
+            if self.rank == 0:
+                print(f"models.ds1017: NVLink5 vocab-parallel LM head disabled: {exc!r}",
+                      file=sys.stderr, flush=True)
+        agree = torch.tensor([ok], dtype=torch.int32, device=head_w.device)
+        dist.all_reduce(agree, op=dist.ReduceOp.MIN, group=pg)
+        if int(agree.item()) != 1 or head is None:
+            if head is not None:
+                head.close()
+            self._vp_head_failed = True
+            return False
+        self._vp_head = head
+        if self.rank == 0:
+            print(f"models.ds1017: NVLink5 vocab-parallel greedy LM head active "
+                  f"(cap={cap}, shard={head.vocab_shard})", file=sys.stderr, flush=True)
+        return True
+
+    def vp_head_step(
+        self,
+        hidden: torch.Tensor | None,
+        *,
+        out_host_uva: torch.Tensor | None = None,
+        last_token: torch.Tensor | None = None,
+        rows_plus1: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        assert self._vp_head is not None
+        top = self._layer_weights()[self.cfg.num_hidden_layers]
+        return self._vp_head.step(hidden, top["head.weight"], out_host_uva=out_host_uva,
+                                  last_token=last_token, rows_plus1=rows_plus1)
+
+    def lm_head(self, hidden: torch.Tensor) -> torch.Tensor:
+        if not hidden.shape[0]:
+            return torch.empty(0, self.cfg.vocab_size, dtype=torch.float32, device=hidden.device)
+        top = self._layer_weights()[self.cfg.num_hidden_layers]
+        return self.layers.linear(hidden, top["head.weight"])
+
     def idle(self) -> None:
         """A step in which this rank has no rows while other ranks of its group have: its part in
         their forward (``Layers.idle``). The executor calls it for a plan without rows."""
         self.layers.idle(self._layer_weights())
         self.placement.step()
+        if self._vp_head is not None:
+            self.vp_head_step(None)
 
     def prepare_idle(self) -> None:
         self.layers.idle_fetch(self._layer_weights())
@@ -420,8 +506,9 @@ class DeepseekV41ForCausalLM:
         when it is time."""
         self.placement.step()
 
-    def forward(self, input_ids: torch.Tensor, positions: torch.Tensor, last_index: torch.Tensor) -> torch.Tensor:
-        """``Transformer.forward``: logits ``[rows, vocab]`` in fp32 at each row's last token."""
+    def forward_backbone(self, input_ids: torch.Tensor, positions: torch.Tensor,
+                         last_index: torch.Tensor) -> torch.Tensor:
+        """All layers through the final RMSNorm: ``[rows, hidden_size]`` bf16 at each row's last token."""
         cfg, layers = self.cfg, self.layers
         weights = self._layer_weights()
         top = weights[cfg.num_hidden_layers]
@@ -447,6 +534,7 @@ class DeepseekV41ForCausalLM:
             if at_yoco:
                 y, h, attn_pre, post, comb, last_index = layers.consumer_inputs(y, h, attn_pre, post, comb,
                                                                               last_index, w)
+            next_eng = (i + 1, weights[i + 1]) if (i + 1) in cfg.engram_layer_ids else None
             if i == cfg.num_hidden_layers - 1 and last_index.numel() < input_ids.numel():
                 # The last layer still writes all KV. Compute attention outputs for
                 # requested positions, retaining one unused lane for the EP collective.
@@ -456,20 +544,25 @@ class DeepseekV41ForCausalLM:
                 post, comb = post[selected], comb[selected]
                 selected_tail = True
             else:
-                x = layers.attention(i, y, w)
+                x = layers.attention(i, y, w, next_engram=next_eng)
             y, h, pre, post, comb = layers.hc_step(x, h, attn_pre, post, comb, w, "ffn")
+            if next_eng is not None:
+                layers.wait_engram_proj(y.device)
             x = layers.moe(i, y, w)
         layers.end()
         if selected_tail and not last_index.numel():
-            return torch.empty(0, cfg.vocab_size, dtype=torch.float32, device=h.device)
+            return torch.empty(0, cfg.hidden_size, dtype=torch.bfloat16, device=h.device)
         idx = last_index if not selected_tail and (last_index.numel() < h.shape[0] or layers.layout is not None) else None
         if x is not None and post is not None and comb is not None:
-            out = layers.hc_epilogue_norm(x, h, post, comb, pre, top["norm.weight"], idx)
-        else:
-            if idx is not None:
-                h, pre = h[idx], pre[idx]
-            out = layers.norm(layers.hc_pre(h, pre), top["norm.weight"])
-        return layers.linear(out, top["head.weight"])
+            return layers.hc_epilogue_norm(x, h, post, comb, pre, top["norm.weight"], idx)
+        if idx is not None:
+            h, pre = h[idx], pre[idx]
+        return layers.norm(layers.hc_pre(h, pre), top["norm.weight"])
+
+    def forward(self, input_ids: torch.Tensor, positions: torch.Tensor, last_index: torch.Tensor) -> torch.Tensor:
+        """``Transformer.forward``: logits ``[rows, vocab]`` in fp32 at each row's last token."""
+        out = self.forward_backbone(input_ids, positions, last_index)
+        return self.lm_head(out)
 
 
 def hf_config(path: str, inline: dict[str, Any]) -> dict[str, Any]:
@@ -496,7 +589,9 @@ class Unit:
                      and config["deepinfer.nvlink_engram"])
         self.model = DeepseekV41ForCausalLM(cfg, config["model.dtype"], config["state.kv.page_size"],
                                             {name: ctx.use(name) for name in self.SERVICES}, symmetric_engram=symmetric,
-                                            graph_idle=config["dsv4.graph_idle_experts"])
+                                            graph_idle=config["dsv4.graph_idle_experts"],
+                                            max_rows=int(config["batch.max_rows"]),
+                                            vp_head_enabled=bool(config["dsv4.vp_head"]) and int(config["sampler.force_topk"]) == 0)
         ctx.effect(lambda: self.model.close, label="model caches and layer hooks")
         ctx.register("state.weights@1", self.model.load_weights, label="load_weights")
         self.model.start()

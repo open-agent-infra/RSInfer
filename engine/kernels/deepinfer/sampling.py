@@ -69,12 +69,48 @@ def _device(values: Sequence[float] | Sequence[int] | torch.Tensor,
     return torch.tensor(values, dtype=dtype, pin_memory=True).to(device, non_blocking=True)
 
 
+def _rotl32(x: torch.Tensor, bits: int) -> torch.Tensor:
+    return ((x << bits) | (x >> (32 - bits))) & 0xFFFFFFFF
+
+
+def _murmur_mix_torch(h: torch.Tensor, k: torch.Tensor) -> torch.Tensor:
+    k = (k * 0xCC9E2D51) & 0xFFFFFFFF
+    k = _rotl32(k, 15)
+    k = (k * 0x1B873593) & 0xFFFFFFFF
+    h = h ^ k
+    h = _rotl32(h, 13)
+    return (h * 5 + 0xE6546B64) & 0xFFFFFFFF
+
+
+def _multinomial_seeded_torch(logprobs: torch.Tensor, seed: torch.Tensor, positions: torch.Tensor) -> torch.Tensor:
+    rows, cols = logprobs.shape
+    seed64 = seed.to(torch.int64)
+    col = torch.arange(cols, dtype=torch.int64, device=logprobs.device)
+    h = torch.zeros((rows, 1), dtype=torch.int64, device=logprobs.device)
+    h = _murmur_mix_torch(h, (seed64 & 0xFFFFFFFF)[:, None])
+    h = _murmur_mix_torch(h, ((seed64 >> 32) & 0xFFFFFFFF)[:, None])
+    h = _murmur_mix_torch(h, (positions.to(torch.int64) & 0xFFFFFFFF)[:, None])
+    h = _murmur_mix_torch(h.expand(rows, cols), (col & 0xFFFFFFFF)[None, :]) ^ 16
+    h = ((h ^ (h >> 16)) * 0x85EBCA6B) & 0xFFFFFFFF
+    h = ((h ^ (h >> 13)) * 0xC2B2AE35) & 0xFFFFFFFF
+    h = (h ^ (h >> 16)) & 0xFFFFFFFF
+    x = h.to(torch.float64) / 0xFFFFFFFF
+    x.log_().clamp_(min=torch.finfo(x.dtype).min, max=-(2.0 ** -32)).neg_()
+    x.log_().neg_()
+    x.add_(logprobs.to(torch.float64))
+    return torch.argmax(x, dim=1, keepdim=True)
+
+
 def sample(logits: torch.Tensor, temperatures: Sequence[float], top_ps: Sequence[float],
            top_ks: Sequence[int], seeds: Sequence[int], positions: Sequence[int] | torch.Tensor,
            _cache: "CachedSampler | None" = None) -> torch.Tensor:
     ks = [1 if 0 <= t < 1e-6 else ((1 << 30) if k == -1 else int(k))
           for t, k in zip(temperatures, top_ks)]
     if all(k == 1 for k in ks):
+        if _cache is not None:
+            fast = _cache.greedy(logits)
+            if fast is not None:
+                return fast
         return torch.argmax(logits, dim=-1).to(torch.int32)
     device = logits.device
     temps = [1.0 if 0 <= t < 1e-6 else float(t) for t in temperatures]
@@ -92,6 +128,15 @@ def sample(logits: torch.Tensor, temperatures: Sequence[float], top_ps: Sequence
     probs = torch.softmax(logits, dim=-1)
     pos = _device(positions, torch.int64, device)
     filtered = not (all(k == 1 << 30 for k in ks) and all(p == 1.0 for p in top_ps))
+    if probs.shape[1] > 1024:
+        if filtered:
+            probs, indices = probs.sort(dim=-1, descending=True)
+            sums = torch.cumsum(probs, dim=-1)
+            probs[torch.arange(0, probs.shape[-1], device=device).view(1, -1) >= k.view(-1, 1)] = 0.0
+            probs[(sums - probs) > p.view(-1, 1)] = 0.0
+            picked = _multinomial_seeded_torch(probs.to(torch.float64).log_(), seed, pos)
+            return torch.gather(indices.to(torch.int32), dim=1, index=picked).view(-1)
+        return _multinomial_seeded_torch(torch.log(probs), seed, pos).view(-1).to(torch.int32)
     if filtered:
         probs, indices = probs.sort(dim=-1, descending=True)
         sums = torch.cumsum(probs, dim=-1)
@@ -121,6 +166,14 @@ class CachedSampler:
     def __init__(self) -> None:
         self.key: Any = None
         self.params: tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor] | None = None
+        self._fast_argmax: Any = None
+
+    def greedy(self, logits: torch.Tensor) -> torch.Tensor | None:
+        if self._fast_argmax is None:
+            from kernels.deepinfer.fast_argmax import FastArgmax
+
+            self._fast_argmax = FastArgmax()
+        return self._fast_argmax.run(logits)
 
     def sample(self, logits: torch.Tensor, temperatures: Sequence[float], top_ps: Sequence[float],
                top_ks: Sequence[int], seeds: Sequence[int], positions: Sequence[int] | torch.Tensor) -> torch.Tensor:

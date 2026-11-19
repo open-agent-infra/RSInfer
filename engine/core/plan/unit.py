@@ -59,6 +59,14 @@ class EagerPlan:
         fetch(self.backends, input_ids, positions)
         return self.model.forward(input_ids, positions, last_index)
 
+    def run_backbone(self, batch: PersistentBatch, plan: BatchPlan, input_ids: Tensor, positions: Tensor,
+                     last_index: Tensor) -> Tensor:
+        key = PlanKey(phase_of(plan), 0)
+        for backend in self.backends:
+            backend.prepare(batch, plan, key)
+        fetch(self.backends, input_ids, positions)
+        return self.model.forward_backbone(input_ids, positions, last_index)
+
 
 def resolution(platform: Any, states: Sequence[StateDecl],
                backends: Mapping[str, Mapping[str, Mapping[str, str]]]) -> dict[str, Any]:
@@ -105,6 +113,8 @@ class Plans:
         self.eager.model.prepare_idle()
         self.idle_graph.replay()
         self.eager.model.stepped()
+        if getattr(self.eager.model, "vp_head_ready", False):
+            self.eager.model.vp_head_step(None)
         return True
 
     def buckets(self, phase: Phase) -> list[int]:
@@ -267,6 +277,10 @@ class Unit:
         uncapturable = sorted(s for s in used if not self.catalog.describe(s).capturable)
         if uncapturable:
             return f"uncapturable decode kernels: {uncapturable}", {}
+        if not steps:
+            prepare_vp = getattr(self.model, "prepare_vp_head", None)
+            if prepare_vp is not None:
+                prepare_vp()
         graphs: dict[int, Any] = {size: VerifyGraphPlan(size, steps, device, self.backends) if steps
                                   else GraphPlan(size, device, self.backends) for size in sorted(sizes, reverse=True)}
         drafts: dict[int, DraftGraphPlan] = ({size: DraftGraphPlan(size, self.model.hidden_size, hidden.dtype, device, attention)

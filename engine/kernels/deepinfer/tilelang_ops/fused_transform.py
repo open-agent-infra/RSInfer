@@ -6,6 +6,7 @@
 From ``deepinfer/model_executor/layers/tilelang_ops/fused_transform.py`` of DeepInfer ``a679bb8`` (LICENSE.deepinfer
 in this directory), without its tests and torch reference; ``PLATFORM`` is CUDA's and the kernel is imported from ``cuda/``."""
 
+import functools
 import math
 from dataclasses import dataclass
 from typing import Literal, Self, cast, overload
@@ -30,6 +31,39 @@ from kernels.deepinfer.tilelang_ops.platform import PLATFORM
 
 
 _L2_CACHE_SIZE = 126 * 1024 * 1024
+
+
+@functools.lru_cache(maxsize=64)
+def _cached_fused_transform_tl(
+    num_heads, head_dim, do_norm, norm_eps, do_rope, rotary_dim, rope_offset,
+    positions_dtype, is_neox, conjugate, do_hadamard, hadamard_scale, cast_fmt,
+    num_per_channels, round_sf, sf_format, return_bf16, bf16_stage, return_quant,
+    cache_layout, block_size, small_batch,
+):
+    return fused_norm_rope_hadamard_cast_store_kvcache_tl(
+        num_heads,
+        head_dim,
+        do_norm=do_norm,
+        norm_eps=norm_eps,
+        do_rope=do_rope,
+        rotary_dim=rotary_dim,
+        rope_offset=rope_offset,
+        positions_dtype=positions_dtype,
+        is_neox=is_neox,
+        conjugate=conjugate,
+        do_hadamard=do_hadamard,
+        hadamard_scale=hadamard_scale,
+        cast_fmt=cast_fmt,
+        num_per_channels=num_per_channels,
+        round_sf=round_sf,
+        sf_format=sf_format,
+        return_bf16=return_bf16,
+        bf16_stage=bf16_stage,
+        return_quant=return_quant,
+        cache_layout=cache_layout,
+        block_size=block_size,
+        small_batch=small_batch,
+    )
 
 
 @dataclass(frozen=True)
@@ -304,29 +338,25 @@ def fused_norm_rope_hadamard_cast_store_kvcache(
     else:
         out_quant = sf = sf_kernel = None
 
-    kernel = fused_norm_rope_hadamard_cast_store_kvcache_tl(
-        num_heads,
-        head_dim,
-        do_norm=norm_args is not None,
-        norm_eps=norm_args.eps if norm_args is not None else 0.0,
-        do_rope=rope_args is not None,
-        rotary_dim=rope_args.rotary_dim if rope_args is not None else 0,
-        rope_offset=rope_offset,
-        positions_dtype=positions_dtype,
-        is_neox=rope_args.is_neox if rope_args is not None else False,
-        conjugate=rope_args.conjugate if rope_args is not None else False,
-        do_hadamard=hadamard_args is not None,
-        hadamard_scale=hadamard_args.scale if hadamard_args is not None else 1.0,
-        cast_fmt=cast_args.fmt if cast_args is not None else "",
-        num_per_channels=cast_args.num_per_channels if cast_args is not None else 0,
-        round_sf=cast_args.round_sf if cast_args is not None else False,
-        sf_format=cast_args.sf_format if cast_args is not None else "",
-        return_bf16=return_bf16,
-        bf16_stage=bf16_stage,
-        return_quant=return_quant,
-        cache_layout=cache_layout,
-        block_size=block_size,
-        small_batch=x.numel() * x.element_size() <= _L2_CACHE_SIZE,
+    kernel = _cached_fused_transform_tl(
+        num_heads, head_dim,
+        norm_args is not None,
+        norm_args.eps if norm_args is not None else 0.0,
+        rope_args is not None,
+        rope_args.rotary_dim if rope_args is not None else 0,
+        rope_offset,
+        positions_dtype,
+        rope_args.is_neox if rope_args is not None else False,
+        rope_args.conjugate if rope_args is not None else False,
+        hadamard_args is not None,
+        hadamard_args.scale if hadamard_args is not None else 1.0,
+        cast_args.fmt if cast_args is not None else "",
+        cast_args.num_per_channels if cast_args is not None else 0,
+        cast_args.round_sf if cast_args is not None else False,
+        cast_args.sf_format if cast_args is not None else "",
+        return_bf16, bf16_stage, return_quant,
+        cache_layout, block_size,
+        x.numel() * x.element_size() <= _L2_CACHE_SIZE,
     )
 
     # Guard for zero tokens

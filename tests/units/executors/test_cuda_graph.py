@@ -314,3 +314,25 @@ def test_idle_ep_replay_obeys_graph_dependencies_and_advances_placement_once() -
     assert plans.replay_idle() and calls == ["fetch", "experts", "placement"]
     catalog.version += 1
     assert not plans.replay_idle() and calls == ["fetch", "experts", "placement"]
+
+
+def test_graph_plan_dirty_tail_zero_copy_and_mark_recorded(pair: tuple[Worker, Worker]) -> None:
+    eager, graph = pair
+    replays = with_graphs(graph, [4])
+    d_ref = Driver(eager)
+    d_g = Driver(graph)
+    for d in (d_ref, d_g):
+        for r, prompt in enumerate(([5, 17, 3], [9, 2, 11], [4, 8, 12])):
+            d.add(r, prompt)
+        d.step({0: 3, 1: 3, 2: 3})
+    # Run 3 rows in bucket 4 (dirty_from becomes 3), then shrink to 1 row (only rows [1:3] need zeroing),
+    # then grow back to 2 rows (verifying zero-copy fast path + padding isolation).
+    for counts in ({0: 1, 1: 1, 2: 1}, {0: 1}, {0: 1, 2: 1}):
+        s_ref = d_ref.step(counts)
+        s_g = d_g.step(counts)
+        torch.testing.assert_close(s_g.logits, s_ref.logits, rtol=2e-4, atol=2e-4)
+    assert replays == [4, 4, 4]
+    batch = graph.service("worker.batch@1")
+    batch.rows[1].has_previous = False
+    batch.mark_recorded([1])
+    assert batch.rows[1].has_previous is True

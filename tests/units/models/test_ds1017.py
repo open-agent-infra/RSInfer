@@ -18,7 +18,7 @@ from safetensors.torch import load_file
 
 from core.contracts.columns import Column
 from core.contracts.kernels import Implementation, Solution
-from core.contracts.plan import GRAPH
+from core.contracts.plan import GRAPH, PlanKey
 from core.contracts.records import StateCopy
 from deploy.models.hf import cut
 from kernels import ds1017_formats as formats
@@ -387,3 +387,28 @@ def test_siblings_restored_from_the_same_window_generate_their_cold_logits(worke
         logits = [first, *d.generate([row], STEPS)[row]]
         assert child.outputs == cold_ids[row]
         same({row: logits}, cold_logits, [row])
+
+
+def test_forward_backbone_and_lm_head_match_forward(model: tuple[dict[str, Any], Path]) -> None:
+    w = fresh(model, **{"sampler.force_topk": 8, "dsv4.decode_overlap": True})
+    try:
+        m = w.service("model@1")
+        assert not m.vp_head_ready
+        assert not m._vp_head_cfg
+        d = driver(w)
+        d.add(0, PROMPTS[0][:10])
+        delta, plan, ops = d.records({0: 10})
+        batch = w.service("worker.batch@1")
+        batch.apply(delta, ops)
+        layers = w.service("layers.ds1017@1")
+        input_ids = torch.tensor(PROMPTS[0][:10], dtype=torch.int64)
+        positions = torch.arange(10, dtype=torch.int64)
+        last_index = torch.tensor([9], dtype=torch.int64)
+        layers.prepare(batch, plan, PlanKey("prefill", 0))
+        ref = m.forward(input_ids, positions, last_index)
+        layers.prepare(batch, plan, PlanKey("prefill", 0))
+        hidden = m.forward_backbone(input_ids, positions, last_index)
+        split = m.lm_head(hidden)
+        torch.testing.assert_close(split, ref, rtol=0.0, atol=0.0)
+    finally:
+        w.close()

@@ -6,11 +6,18 @@
 From ``deepinfer/model_executor/layers/tilelang_ops/store_kv_cache.py`` of DeepInfer ``a679bb8`` (LICENSE.deepinfer
 in this directory), without its tests and torch reference; ``PLATFORM`` is CUDA's and the kernel is imported from ``cuda/``."""
 
+import functools
+
 import torch
 
 from kernels.deepinfer.tilelang_ops.cache_common import KVCacheFormat, fp4_cache_kernel_kwargs, resolve_kv_cache_layout, split_kv_cache
 from kernels.deepinfer.tilelang_ops.cuda.store_kv_cache import store_kv_cache_tl
 from kernels.deepinfer.tilelang_ops.platform import PLATFORM
+
+
+@functools.lru_cache(maxsize=64)
+def _cached_store_tl(layout: KVCacheFormat, block_size: int, kw: tuple) -> object:
+    return store_kv_cache_tl(layout, block_size, **dict(kw))
 
 
 def _flatten_kv(kv: torch.Tensor, n: int, layout: KVCacheFormat) -> torch.Tensor:
@@ -67,5 +74,5 @@ def store_kv_cache(
     kernel_kwargs = {}
     if layout.quantized_dtype == "e2m1":
         kernel_kwargs = fp4_cache_kernel_kwargs(cache)
-    store_kernel = store_kv_cache_tl(layout, block_size, **kernel_kwargs)
+    store_kernel = _cached_store_tl(layout, block_size, tuple(kernel_kwargs.items()) if kernel_kwargs else ())
     store_kernel(kv, cache_value, cache_sf, slot_mapping)
