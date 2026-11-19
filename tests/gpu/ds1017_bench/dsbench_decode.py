@@ -72,7 +72,7 @@ def read_windows(
     stamps = stamps[warmup_steps : warmup_steps + measure_steps + 1]
     intervals = intervals[warmup_steps + 1 : warmup_steps + measure_steps + 1]
     assert epochs == list(range(epochs[0], epochs[0] + measure_steps + 1))
-    steps = [1000.0 * (b - a) for a, b in zip(stamps, stamps[1:], strict=True)]
+    steps = [1000.0 * (b - a) for a, b in zip(stamps[:-1], stamps[1:], strict=True)]
     sps = measure_steps / (stamps[-1] - stamps[0])
     device_ms = (
         statistics.mean(max(v[1] for v in entry.values()) / 1000.0 for entry in intervals)
