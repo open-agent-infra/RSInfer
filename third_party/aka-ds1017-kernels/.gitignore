@@ -1,0 +1,7 @@
+.venv/
+build/
+dist/
+*.egg-info/
+__pycache__/
+.pytest_cache/
+src/aka_ds1017/kernels.tar.gz

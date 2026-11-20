@@ -1,0 +1,63 @@
+{
+  "archive_sha256": "e7ea9275999b4e8f077f32ada585c906e607c0044dac92e2c4e26801cdd55179",
+  "revisions": {
+    "index-consumer": {
+      "starting_revision": "a637410d65d537af834f28c3d71bd27a00a705e0",
+      "selected_revision": "8b18b994252e4d8862a3bf786659514b3143c877"
+    },
+    "index-producer": {
+      "starting_revision": "fcaa72a9aa1d4b893790e59d406b726ed2a14570",
+      "selected_revision": "38e3fd473416c752cf1254ba657afec5c521e64e"
+    },
+    "megamoe-consumer": {
+      "starting_revision": "c459e9cd8bdbadaa68cfd459a8626c9dcff149b8",
+      "selected_revision": "c459e9cd8bdbadaa68cfd459a8626c9dcff149b8"
+    },
+    "megamoe-producer": {
+      "starting_revision": "b4d81802f92c1a9c51af11a80224d7d1b5d38e15",
+      "selected_revision": "b4d81802f92c1a9c51af11a80224d7d1b5d38e15"
+    },
+    "mhc-consumer": {
+      "starting_revision": "dffc865e723517aa4aef2901261112ca712afb57",
+      "selected_revision": "dffc865e723517aa4aef2901261112ca712afb57"
+    },
+    "mhc-producer": {
+      "starting_revision": "246b34bf46c2193e566ec6bf1c2bd2a901915426",
+      "selected_revision": "7f9f737cf4bec3657b377262ce17331cfdc2d88c"
+    },
+    "mla-consumer": {
+      "starting_revision": "5b23d68bf43fa4f1b04720b88bdf97f9ece4af9d",
+      "selected_revision": "5b8908a39b92d8df7b68276b85ec9201224a0b90"
+    },
+    "mla-producer": {
+      "starting_revision": "720837a6a80eadc062dec1177eda286953a7b06b",
+      "selected_revision": "720837a6a80eadc062dec1177eda286953a7b06b"
+    },
+    "projection-consumer": {
+      "starting_revision": "1697afc731a2bae3d1f07614631bb507e32f79f2",
+      "selected_revision": "1697afc731a2bae3d1f07614631bb507e32f79f2"
+    },
+    "projection-producer": {
+      "starting_revision": "bf0c6c81c992b221d696c012f0d11959d1d76569",
+      "selected_revision": "bf0c6c81c992b221d696c012f0d11959d1d76569"
+    }
+  },
+  "original_tree": {
+    "index_consumer": "36626d1c840a01f75d9cc4e80d46ced6cb766008c655258b24bceea201da7d24",
+    "index_producer": "422e20e8e8e7b36860c4716926e140e9072e28a6911e9a3fde5e6e6b72754791",
+    "megamoe_consumer": "c90779a9f9ed808ee81f66bbcd6e280120725fc05750e5dc1091e1c6da4715b5",
+    "megamoe_producer": "cc768eb1a89a6dc82463b958ab6699721c3fcdf33940a0700e13663f0048caa8",
+    "mla_consumer": "c8c7386a90311803351a6cc8239a9b59e1962189c1852b90c0f191a7448d5e39",
+    "mla_producer": "d6e666a0a48f158e598a302a1416f2adf9a275fa062f2c33c3c5131de2e63796",
+    "mla_r1720": "6f19c8ea7e5f94aab2e94fd2298bf589c5ab7150bfb68473ebd880b68273a18f",
+    "paged_bridge": "ff6c1b533c58c8fe85e6ef58cdc3559e0e343a6aee58ba7fe1acbfe99033de0e",
+    "projection_consumer": "6270150de3d0d2f6322e852f1a41ef0cd5b4df4085e76a099c889b2708dc4e15",
+    "projection_producer": "980f28a54611d495d3c988d2f53d5ac2b86de0f526d05dd8d72705c9cac626f3",
+    "r1720_gb": "251cbdc7a18b56628d6931e24e56edce4a425e8bb32acbe6fb59e397bfe8dd6a",
+    "r1720_gc": "309f0d72f03acf863461a9996b85d6b430364f60f6eb8b5fae49ea8e041738ad",
+    "r1720_gp": "fd49c226dcc3f82891132974d966c35065ab26c33c08b2878b3412d1b5097060",
+    "r1720_ic": "4cf4c718c61d89219f1df0d78dd39d4c60359145997e8ed146274e0982b84dca",
+    "r1720_ip": "e499a7eaed8e16dd53e90a4558d48b75d984a7a6c00e9922fc6df1e5d91714a5",
+    "speed_i": "ad5921dbe3cfbf4d8830c705d46758898df8761057099fdedb67ca12bfcdc557"
+  }
+}

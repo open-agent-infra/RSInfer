@@ -1,0 +1,77 @@
+{
+  "index_consumer": [
+    "common/deepgemm",
+    "common/index",
+    "variants/index_consumer"
+  ],
+  "index_producer": [
+    "common/deepgemm",
+    "common/index",
+    "variants/index_producer"
+  ],
+  "megamoe_consumer": [
+    "common/deepgemm",
+    "common/megamoe",
+    "variants/megamoe_consumer"
+  ],
+  "megamoe_producer": [
+    "common/deepgemm",
+    "common/megamoe",
+    "variants/megamoe_producer"
+  ],
+  "mla_consumer": [
+    "common/mla",
+    "variants/mla_consumer"
+  ],
+  "mla_producer": [
+    "common/mla",
+    "variants/mla_producer"
+  ],
+  "mla_r1720": [
+    "common/mla",
+    "variants/mla_r1720"
+  ],
+  "paged_bridge": [
+    "variants/paged_bridge"
+  ],
+  "projection_consumer": [
+    "common/deepgemm",
+    "common/projection",
+    "variants/projection_consumer"
+  ],
+  "projection_producer": [
+    "common/deepgemm",
+    "common/projection",
+    "variants/projection_producer"
+  ],
+  "r1720_gb": [
+    "common/deepgemm",
+    "common/mhc",
+    "variants/r1720_gb"
+  ],
+  "r1720_gc": [
+    "common/deepgemm",
+    "common/mhc",
+    "variants/r1720_gc"
+  ],
+  "r1720_gp": [
+    "common/deepgemm",
+    "common/mhc",
+    "variants/r1720_gp"
+  ],
+  "r1720_ic": [
+    "common/deepgemm",
+    "common/index",
+    "variants/r1720_ic"
+  ],
+  "r1720_ip": [
+    "common/deepgemm",
+    "common/index",
+    "variants/r1720_ip"
+  ],
+  "speed_i": [
+    "common/deepgemm",
+    "common/index",
+    "variants/speed_i"
+  ]
+}
