@@ -13,7 +13,7 @@ namespace deep_gemm::mlopart {
 // We have to use IPC to allocate localized memory via MLOPart prior to CUDA 13.4
 // For convenience this is done in Python
 static pybind11::module_ get_module() {
-    return pybind11::module_::import("aka_mlopart");
+    return pybind11::module_::import("aka_ds1017._mlopart");
 }
 
 static pybind11::bytes get_device_uuid() {

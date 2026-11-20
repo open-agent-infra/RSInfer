@@ -31,7 +31,9 @@ def main():
         from .loader import load
         Kernels(policy)
         for name in sorted(candidates):
-            load(name)
+            module = load(name)
+            if name.startswith("megamoe_"):
+                module.native.locality_domain.is_localization_available()
             print("built",name,flush=True)
 
 
