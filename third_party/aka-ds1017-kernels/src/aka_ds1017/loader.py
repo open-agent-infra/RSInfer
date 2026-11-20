@@ -36,7 +36,7 @@ def source_tree():
     compiler = subprocess.check_output([str(Path(CUDA_HOME) / "bin/nvcc"), "--version"])
     abi = (platform.machine(), sys.implementation.cache_tag, torch.__version__, torch.version.cuda,
            torch.compiled_with_cxx11_abi(), torch.cuda.get_device_capability(), compiler.decode())
-    base = Path(os.getenv("AKA_DS1017_CACHE", Path.home() / ".cache" / "aka-ds1017"))
+    base = Path(os.getenv("AKA_DS1017_CACHE", Path.home() / ".cache" / "aka-ds1017")).expanduser().resolve()
     base.mkdir(parents=True, exist_ok=True)
     root = base / (digest + "-" + hashlib.sha256(repr(abi).encode()).hexdigest()[:16])
     with locked(base / (root.name + ".lock")):
