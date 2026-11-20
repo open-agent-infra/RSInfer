@@ -210,3 +210,13 @@ def test_balance_prefill_and_coordinated_prefill_interval() -> None:
         b.run_until(b.finished(1, 2, 3, 4))
         check(b, [*first, *later])
         assert served(b, 0) & {3, 4} and served(b, 1) & {3, 4}
+
+
+@pytest.mark.parametrize("lengths,uniform", [((3, 3), True), ((3, 4), False)])
+def test_ep_domains_share_one_prefill_geometry_hint(lengths: tuple[int, int], uniform: bool) -> None:
+    reqs = [request(i + 1, list(range(n)), 1) for i, n in enumerate(lengths)]
+    with bed(config=TWO) as b:
+        b.client.send(reqs)
+        b.run_until(b.finished(1, 2))
+        first = [worker.fixture.plans_seen[0][1] for worker in b.workers]
+        assert [plan.uniform_prefill for plan in first] == [uniform, uniform]

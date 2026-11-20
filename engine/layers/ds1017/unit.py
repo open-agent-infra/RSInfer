@@ -581,6 +581,7 @@ class Layers:
         if plan.draft_tokens:
             raise ValueError("layers.ds1017 runs no speculative step yet")
         self._sync_flags()
+        self.group.uniform_prefill = plan.uniform_prefill and key.phase == "prefill"
         self.table = GRAPH if key.bucket else key.phase
         self.bucket = key.bucket
         self.batch_tables = batch.binding.buffers()

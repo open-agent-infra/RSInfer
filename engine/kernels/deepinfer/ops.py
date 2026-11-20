@@ -526,7 +526,7 @@ def _strided_f32(t: torch.Tensor) -> torch.Tensor:
 def index_topk(q_data: torch.Tensor, q_scales: torch.Tensor, weights: torch.Tensor, k_data: torch.Tensor,
                k_scales: torch.Tensor, ks: torch.Tensor, ke: torch.Tensor, longest: int, topk: int, mode: str,
                candidates: torch.Tensor | None, topk_blocks: int, block: int,
-               cache: dict[Any, Any] | None = None) -> tuple[torch.Tensor, torch.Tensor | None]:
+               cache: dict[Any, Any] | None = None, *, tuning: Any = None) -> tuple[torch.Tensor, torch.Tensor | None]:
     """``MQA._topk_prefill``: DeepGEMM's logits over the loaded keys (``fp8_fp4_mqa_logits``, or over the
     candidate blocks only with ``fp8_fp4_sparse_mqa_logits``), DeepSelect's top-k, query chunk by
     query chunk."""
@@ -569,6 +569,12 @@ def index_topk(q_data: torch.Tensor, q_scales: torch.Tensor, weights: torch.Tens
         ks_off = ks32
     klen = ke32 - ks32
     width = max(longest, 1)  # the logits' width: one compiled candidate kernel for every step (max_kv_len)
+    if (tuning is not None and cache is not None and direct_out and topk == 512 and block == 8
+            and (mode != "source" or topk_blocks == 2048)
+            and (mode != "user" or candidates is not None and candidates.shape[1] == 2048)):
+        impl = tuning.pick("index", n, mode)
+        if impl is not None:
+            return tuning.index(impl, q, kv, w, ks32, ke32, klen, ks_off, width, mode, candidates, out, picked, cache)
     score_columns = topk_blocks * block if mode == "user" else width
     chunk = max(8, min(8192, INDEX_ROW_BYTES // (score_columns * 2) // 8 * 8))
     for a in range(0, n, chunk):

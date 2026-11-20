@@ -91,6 +91,10 @@ class BatchPlan(msgspec.Struct, frozen=True):
     """Optional original prompt lengths, one per row. Bounded decoder replay uses the entire
     prompt suffix across chunk boundaries. Empty: older producers use full decoder replay."""
 
+    uniform_prefill: bool = False
+    """All EP domains have the same ordered prefill counts, positions and prompt lengths.
+    A missing hint keeps collectives on their general implementation."""
+
 
 class StateAssign(msgspec.Struct, frozen=True):
     """Items of one state kind newly given to rows: pages for paged kinds, a slot at admission

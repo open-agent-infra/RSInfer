@@ -1478,7 +1478,12 @@ class Scheduler:
                     step = steps[self._domain(request.row)]
                     step.added.append(AddedRow(request.row, request.input.request, request.input.sampling))
                     step.assign_all(request.row, self._ledger(request).items(request.input.request))
-        records = [self._record(step) for step in steps]
+        first = steps[0]
+        uniform_prefill = bool(first.prefills and not first.decodes and len(steps) > 1) and all(
+            step.prefills and not step.decodes and step.positions == first.positions
+            and step.prompt_lengths == first.prompt_lengths
+            and tuple(step.counts.values()) == tuple(first.counts.values()) for step in steps[1:])
+        records = [self._record(step, uniform_prefill) for step in steps]
         rows = {row: rid for step in steps for row, rid in step.rows.items()}
         counts = {row: n for step in steps for row, n in step.counts.items()}
         self.table.start_step(epoch, rows, counts)
@@ -1498,7 +1503,7 @@ class Scheduler:
         self.full = False
         self.removed.clear()
 
-    def _record(self, step: _Step) -> OpenRecord:
+    def _record(self, step: _Step, uniform_prefill: bool = False) -> OpenRecord:
         """A domain's part of a step, its rows as its ranks number them."""
         base = step.base
         phase: Literal["prefill", "decode", "mixed"] = (
@@ -1509,7 +1514,7 @@ class Scheduler:
                           Column.of("u8", step.from_previous), phase, 0, self.settings.draft_tokens,
                           Column.of("i64", step.next_tokens if self.settings.draft_tokens or
                                     (step.prefills and any(t >= 0 for t in step.next_tokens)) else []),
-                          Column.of("i32", step.prompt_lengths if phase != "decode" else []))
+                          Column.of("i32", step.prompt_lengths if phase != "decode" else []), uniform_prefill)
         state = StateOps([StateAssign(kind, Column.of("i32", [row - base for row in per_row]),
                                       *ragged("i32", per_row.values())) for kind, per_row in step.assign.items()],
                          [StateCopy(kind, when, Column.of("i32", [src for src, _ in cs]),

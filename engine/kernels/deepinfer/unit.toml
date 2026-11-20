@@ -14,3 +14,5 @@ config = ["sched.token_budget", "batch.max_rows"]
 [config]
 "deepinfer.force_random_gate" = { type = "bool", default = false, binding = "startup", doc = "Benchmarks only: the fused MoE gate picks every token's experts at random, so the ranks carry even loads, as DeepInfer's examples/benchmark.py measures (DEEPINFER_FORCE_LOAD_BALANCE). The text is then meaningless" }
 "deepinfer.nvlink_engram" = { type = "bool", default = true, binding = "startup", doc = "Place distributed Engram shards in NVLink symmetric memory with Triton direct gather when all ranks share an NVLink domain, falling back to deep_ep.EngramBuffer otherwise" }
+"deepinfer.aka_profile" = { type = "str", default = "official", binding = "startup", doc = "DS1017 SM100 prefill kernel policy: official, validated (32K/64K), or expanded (also 4K/8K/16K)." }
+"deepinfer.aka_disable" = { type = "str", default = "", binding = "startup", doc = "Comma-separated operators to keep official: projection, index, mhc, mla, megamoe." }

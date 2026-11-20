@@ -40,6 +40,7 @@ class Group:
     def __init__(self, size: int = 1, rank: int = 0, device_group: Any = None) -> None:
         self.size, self.rank = size, rank
         self.device_group = device_group
+        self.uniform_prefill = False
         """The ``ProcessGroup`` for tensors where they are (NCCL); ``None``: they go through the host."""
         self.collectives = 0
         """How many ``gather`` and ``reduce`` calls this rank made: equal on every rank after a step."""

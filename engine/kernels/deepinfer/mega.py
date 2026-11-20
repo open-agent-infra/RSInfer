@@ -38,6 +38,7 @@ from flash_mla import fused_norm_rope_attn_rope_cast
 
 from kernels import ds1017_formats as formats
 from kernels.deepinfer import ops
+from kernels.deepinfer.tuning import Official
 from kernels.ds1017_formats import BLOCK, packed_words
 
 BF16 = torch.bfloat16
@@ -74,7 +75,8 @@ class Alone:
 class Mega:
     """This rank's part of the ranks' shared MoE and Engram buffers, and the fused solutions over them."""
 
-    def __init__(self, max_tokens: int, force_random: bool = False, *, nvlink_engram: bool = True) -> None:
+    def __init__(self, max_tokens: int, force_random: bool = False, *, nvlink_engram: bool = True, kernels: Any = Official) -> None:
+        self.kernels = kernels
         self.max_tokens = max_tokens
         """Tokens a rank brings to one step at most (a prefill's budget and the decoding rows)."""
         self.force_random = force_random
@@ -98,7 +100,7 @@ class Mega:
         self.engram_hooks: list[Any] = []
         self._id_hc: tuple[int, int, torch.device, torch.Tensor, torch.Tensor, torch.Tensor] | None = None
         self._cache: dict[tuple[Any, ...], tuple[tuple[int, ...], Any]] = {}
-        self._block_m_memo: dict[tuple[int, int, int, int, int], int] = {}
+        self._block_m_memo: dict[tuple[int, int, int, int, int, bool], int] = {}
         self._win_memo: tuple[torch.Tensor, int, torch.Tensor, torch.Tensor] | None = None
         self._lat_memo: dict[int, tuple[torch.Tensor, int, torch.Tensor, torch.Tensor]] = {}
         self._sparse_memo: dict[int, tuple[torch.Tensor, int, torch.Tensor]] = {}
@@ -229,7 +231,7 @@ class Mega:
                     y_fp8 = torch.empty(tokens, hidden, dtype=E4M3, device=device)
                     m_pad = deep_gemm.get_tma_aligned_size(tokens, 4)
                     gemm_sf = torch.empty(hidden // 128, m_pad, dtype=torch.int32, device=device).mT[:tokens]
-                deep_gemm.mega_mhc(
+                self.kernels.mhc(
                     zx, residual.contiguous(), pre.contiguous().view(tokens, hc, 1), zp, ec,
                     fn=fn, mix_scales=scale, mix_bases=base, hc_mult=hc,
                     hc_norm_eps=norm_eps, hc_pre_eps=hc_eps, hc_post_scale=POST_SCALE, sinkhorn_eps=hc_eps,
@@ -267,14 +269,15 @@ class Mega:
                                  "(sched.token_budget + batch.max_rows)")
             symm = self.symm(group, slots, topk, hidden, inter)
             y_fp8, routed, shared = symm.x[:tokens], symm.x_sf[:tokens], symm.shared_l1_acts_sf[:tokens]
-            bm_key = (group.size, slots, symm.num_max_tokens_per_rank, tokens, topk)
+            uniform = getattr(group, "uniform_prefill", False)
+            bm_key = (group.size, slots, symm.num_max_tokens_per_rank, tokens, topk, uniform)
             cached_bm = self._block_m_memo.get(bm_key)
             if cached_bm is None:
                 cached_bm = self._block_m_memo[bm_key] = int(
-                    deep_gemm.get_block_m_for_mega_moe(*bm_key, "fp8xfp4")
+                    self.kernels.block(group.size, slots, symm.num_max_tokens_per_rank, tokens, topk, "fp8xfp4", uniform=uniform)
                 )
             block_m = cached_bm
-        deep_gemm.mega_mhc(
+        self.kernels.mhc(
             x.contiguous(), residual.contiguous(), pre.contiguous().view(tokens, hc, 1),
             post.contiguous().view(tokens, hc, 1), comb.contiguous(), fn=fn, mix_scales=scale, mix_bases=base, hc_mult=hc,
             hc_norm_eps=norm_eps, hc_pre_eps=hc_eps, hc_post_scale=POST_SCALE, sinkhorn_eps=hc_eps,
@@ -356,7 +359,7 @@ class Mega:
         x_fp8 = staged if staged is not None and staged[0].shape == rows.shape else ops._cast(rows)
         w_qkv = self._qkv_weights(wq_a, pq_a, wkv, pkv)
         qkv = ops._out(tokens, q_lora + kv_dim, BF16, device)
-        deep_gemm.fp8_fp4_gemm_nt(x_fp8, w_qkv, qkv, None, recipe=(1, 1, BLOCK))
+        self.kernels.gemm(x_fp8, w_qkv, qkv, None, recipe=(1, 1, BLOCK))
         qr = qkv[:, :q_lora]
         if qr.stride(-1) != 1 or qr.stride(0) % 16 != 0:
             qr = qr.contiguous()
@@ -369,7 +372,7 @@ class Mega:
         q_cols = heads * head_dim
         extra_cols = 0 if iwq_b is None else iwq_b.shape[0]
         qb_out = ops._out(tokens, q_cols + extra_cols, BF16, device)
-        deep_gemm.fp8_fp4_gemm_nt(qr_fp8, w_qb, qb_out, None, recipe=(1, 1, BLOCK))
+        self.kernels.gemm(qr_fp8, w_qb, qb_out, None, recipe=(1, 1, BLOCK))
         q = qb_out[:, :q_cols].unflatten(-1, (heads, head_dim))
         iq = None if iwq_b is None else qb_out[:, q_cols:]
         return q, qkv[:, q_lora:], iq
@@ -384,9 +387,9 @@ class Mega:
         wv_sf = torch.empty_strided((tokens, (groups * o_lora) // 128),
                                     (1, deep_gemm.get_tma_aligned_size(tokens, 4)),
                                     dtype=torch.int32, device=device)
-        deep_gemm.fp8_einsum("bhr,hdr->bhd", (ctx_fp8, ctx_sf), wv, (wv_fp8, wv_sf), recipe=(1, 1, BLOCK))
+        self.kernels.einsum("bhr,hdr->bhd", (ctx_fp8, ctx_sf), wv, (wv_fp8, wv_sf), recipe=(1, 1, BLOCK))
         out = ops._out(tokens, hidden, BF16, device)
-        deep_gemm.fp8_fp4_gemm_nt((wv_fp8.flatten(1, 2), wv_sf),
+        self.kernels.gemm((wv_fp8.flatten(1, 2), wv_sf),
                                   (wo_b.view(E4M3), packed_words(po_b, hidden)), out, None, recipe=(1, 1, BLOCK))
         return out
 
@@ -426,7 +429,7 @@ class Mega:
                         self._lat_memo.clear()
                     self._lat_memo[id(latent_idx)] = (latent_idx, lv, extra_idx, extra_count)
         q_in = q if q.stride(-1) == 1 and q.stride(1) == head_dim and q.stride(0) % 16 == 0 else q.contiguous()
-        ctx_fp8, ctx_sf, _ = fused_norm_rope_attn_rope_cast.decode(
+        ctx_fp8, ctx_sf, _ = self.kernels.paged(
             q=q_in, k_cache=window.unsqueeze(2), indices_in_kvcache=main, sm_scale=scale, d_v=head_dim,
             attn_sink=sink, topk_length=count, extra_k_cache=extra, extra_indices_in_kvcache=extra_idx,
             extra_topk_length=extra_count, enable_q_norm=False, rms_norm_eps=0.0,
@@ -456,7 +459,7 @@ class Mega:
                     self._sparse_memo.clear()
                 self._sparse_memo[id(idx)] = (idx, sv, listed)
         q_in = q if q.stride(-1) == 1 and q.stride(1) == head_dim and q.stride(0) % 16 == 0 else q.contiguous()
-        ctx_fp8, ctx_sf, _, _ = fused_norm_rope_attn_rope_cast.prefill(
+        ctx_fp8, ctx_sf, _, _ = self.kernels.prefill(
             q=q_in, kv=source.unsqueeze(1), indices=listed.unsqueeze(1), sm_scale=scale, attn_sink=sink,
             topk_length=None, enable_q_norm=False, rms_norm_eps=0.0,
             token_positions=ops._as_i32(positions), is_rope_neox_style=False, rope_dim=rotary,
@@ -493,11 +496,12 @@ class Mega:
                 scoring_func="sqrtsoftplus", out=(symm.topk_idx[:tokens], symm.topk_weights[:tokens]))
         self.staged = -1
         out = torch.empty(tokens, hidden, dtype=BF16, device=x.device)
-        deep_gemm.fp8_fp4_mega_moe(
+        self.kernels.moe(
             out, (w13.view(torch.int8), packed_words(p13, 2 * inter)), (w2.view(torch.int8), packed_words(p2, hidden)), symm,
             shared_l1_weights=(sw13.view(E4M3), packed_words(sp13, 2 * inter)),
             shared_l2_weights=(sw2.view(E4M3), packed_words(sp2, hidden)), cumulative_local_expert_recv_stats=taken,
-            activation="swiglu", activation_clamp=limit if limit > 0 else None, fast_math=True)
+            activation="swiglu", activation_clamp=limit if limit > 0 else None, fast_math=True,
+            uniform=getattr(group, "uniform_prefill", False))
         return out
 
     def _random(self, tokens: int, device: torch.device) -> torch.Tensor | None:

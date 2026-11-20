@@ -12,6 +12,7 @@ The Engram rows of ranks that share the tables still travel through the group's 
 
 from __future__ import annotations
 
+from functools import partial
 import importlib.util
 from importlib.metadata import PackageNotFoundError, version
 from typing import Any
@@ -66,6 +67,9 @@ class Unit:
             return
         from kernels.deepinfer import ops
 
+        from kernels.deepinfer.tuning import Official, configure
+
+        tuning = configure(config["deepinfer.aka_profile"], config["sched.token_budget"], config["deepinfer.aka_disable"])
         ops.align_experts()
         for definition, source, shapes in SOLUTIONS:
             if definition == "ds.linear@1":
@@ -73,6 +77,8 @@ class Unit:
             solution = f"{BACKEND}.{definition}"
             name = definition.split(".", 1)[1].split("@")[0]
             implementation = getattr(ops, name)
+            if name == "index_topk" and tuning is not Official:
+                implementation = partial(implementation, tuning=tuning)
             ctx.register("kernels.catalog@1", Implementation(
                 Solution(solution, definition, f"{ops.__name__}:{name}", library=library(source), shapes=shapes,
                          capturable=definition not in HOST_DEPENDENT, requires=["cuda", "sm_100"]), implementation),
@@ -90,6 +96,7 @@ class Unit:
         mega = Mega(
             config["sched.token_budget"] + config["batch.max_rows"],
             config["deepinfer.force_random_gate"],
+            kernels=tuning,
             nvlink_engram=bool(config["deepinfer.nvlink_engram"]),
         )
         ctx.effect(lambda: mega.close, label="fused MoE and Engram buffers")
