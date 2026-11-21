@@ -1,5 +1,5 @@
 """Temporary checks written into the engine's code to look inside a running engine are marked
-``# PROBE`` (``.claude/skills/agxinfer/SKILL.md``, 「在引擎里做检查」): none may stay in the tree.
+``# PROBE`` (``.claude/skills/rsinfer/SKILL.md``, 「在引擎里做检查」): none may stay in the tree.
 
 The skill keeps them in a copy of the tree (a second workspace applied with ``--source``), so the
 repo never has them; this is the net for one written into the repo itself."""

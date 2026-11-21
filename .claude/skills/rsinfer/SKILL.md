@@ -1,9 +1,9 @@
 ---
-name: agxinfer
-description: Working in the agxinfer repository - where each component, unit, test and document lives (the directory map), and how to develop on a running engine by hot-applying changes (check, apply --dry-run, apply, --wait-empty, --force), what a normal refusal looks like, how to swap weights on a running engine (weights.path, model.dtype), what to do when a rollback fails and status shows stale units (introspect, restart), and how to report a bug of the update mechanism in doc/framework-bugs/. Use before changing code, tests or docs in this repository, or when starting, changing or debugging a running engine.
+name: rsinfer
+description: Working in the RSInfer repository - where each component, unit, test and document lives (the directory map), and how to develop on a running engine by hot-applying changes (check, apply --dry-run, apply, --wait-empty, --force), what a normal refusal looks like, how to swap weights on a running engine (weights.path, model.dtype), what to do when a rollback fails and status shows stale units (introspect, restart), and how to report a bug of the update mechanism in doc/framework-bugs/. Use before changing code, tests or docs in this repository, or when starting, changing or debugging a running engine.
 ---
 
-# agxinfer：目录地图与热改开发
+# RSInfer：目录地图与热改开发
 
 规矩在 [AGENTS.md](../../../AGENTS.md)；这里是东西在哪，以及怎么在跑着的引擎上改东西。本文件的目录地图要和代码保持一致（AGENTS.md「文档是开发笔记」）。
 
@@ -19,7 +19,7 @@ description: Working in the agxinfer repository - where each component, unit, te
 | `.github/workflows/ci.yml`、`.github/scripts/framework_changed.py` | CI：`uv sync --python 3.12 --extra cpu`、`uv run pyright`、`uv run pytest -n 8`。跑在组织自己的 Linux runner 上（`runs-on: ubuntu-latest`，2026-11-12 起；不用 GitHub 的 runner，那边按分钟算配额），`notify.yml` 也是。runner 是常驻的，uv 的缓存留在它的 `~/.cache/uv`。CI 里 `OMP_NUM_THREADS=1`：runner 的机器核多，不限的话每个引擎进程的 torch 都按核数开线程，两次 CI 同时跑会互相拖到单个测试超时；测试用的模型很小，一个线程跑得一样快。PR 每次 push 只跑一遍；push 只在 `master` 上触发。PR 和 push 没碰框架本体（`engine/framework.toml` 列出的模块）、`tests/framework/`、共用的测试设置、依赖和 `.github/` 时，跳过 `tests/framework/` |
 | `.github/workflows/notify.yml`、`.github/scripts/notify.py` | 每个合进 `master` 的 PR 都由 LLM 写一句话摘要发到通知群；密钥 `PR_NOTIFY_WEBHOOK`、`PR_NOTIFY_SECRET`、`LLM_API_KEY`、`LLM_BASE_URL`，可选变量 `LLM_MODEL` |
 | `pyproject.toml`、`uv.lock` | 依赖与 pytest / pyright 配置 |
-| `.claude/skills/agxinfer/SKILL.md` | 本文件：目录地图与热改开发。Claude Code 按 skill 自动加载，其他 agent 照 AGENTS.md 的指引读它。用户同意为它新开 `.claude/` |
+| `.claude/skills/rsinfer/SKILL.md` | 本文件：目录地图与热改开发。Claude Code 按 skill 自动加载，其他 agent 照 AGENTS.md 的指引读它。用户同意为它新开 `.claude/` |
 | `deploy/` | 部署工具，不属于 pytest，用户同意为它新开这个顶层目录。`agxinfer.py`：命令行，在一台机器上起引擎、看状态、停、睡和醒（`serve` / `status` / `stop` / `sleep` / `wake`），改跑着的引擎（`control`，即控制面客户端），发请求（`chat` / `complete`），生成测试用的 checkpoint（`checkpoint`）；`models/`：每个模型家族一个 recipe（现在只有 `qwen38.py`），按 `config.json` 选；说明见 `deploy/README.md`；在 pyright 的范围内 |
 
 ### `engine/`

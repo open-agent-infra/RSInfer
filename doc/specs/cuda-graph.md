@@ -217,7 +217,7 @@ holder 当前只预算权重和状态池，需为 graph 私有池、metadata、w
 
 ### 7.3 开发方式
 
-遵循 [仓库 skill](../../.claude/skills/agxinfer/SKILL.md)：平台基础接入后起常驻引擎，后续修改执行 `check → apply --dry-run → apply → 请求验证`；有请求时使用 `--wait-empty`，只有明确需要中止请求才用 `--force`。比较热改结果与同代码冷启动结果。
+遵循 [仓库 skill](../../.claude/skills/rsinfer/SKILL.md)：平台基础接入后起常驻引擎，后续修改执行 `check → apply --dry-run → apply → 请求验证`；有请求时使用 `--wait-empty`，只有明确需要中止请求才用 `--force`。比较热改结果与同代码冷启动结果。
 
 热改跑到旧代码、漏重建、撤回失败或持续资源增长时，在 [doc/framework-bugs/](../framework-bugs/README.md) 写报告；只有确认无法继续热改时退回冷启动。该开发流程不替代提交前测试。
 

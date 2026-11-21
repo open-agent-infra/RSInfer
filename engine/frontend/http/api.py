@@ -3,7 +3,7 @@
 
 See ../LICENSE.mini-sglang. Retains FrontendManager's per-request ack/event maps,
 listener, wait_for_ack and StreamingResponse cancellation flow. Changes are the
-agxinfer record channel, instance-owned app/lifespan, identity metadata, actual
+rsinfer record channel, instance-owned app/lifespan, identity metadata, actual
 finish reasons and token counts, and disconnect/stop cleanup.
 
 The frontend is the gate of the engine for changes (doc/specs/empty-apply.md): while one runs it
@@ -393,7 +393,7 @@ def create_app(manager: FrontendManager) -> FastAPI:
         finally:
             await manager.shutdown()
 
-    app = FastAPI(title="agxinfer", lifespan=lifespan)
+    app = FastAPI(title="rsinfer", lifespan=lifespan)
 
     @app.exception_handler(HTTPException)
     async def http_error(request: Request, exc: HTTPException) -> JSONResponse:
@@ -410,7 +410,7 @@ def create_app(manager: FrontendManager) -> FastAPI:
     @app.get("/v1/models")
     async def models() -> dict[str, Any]:
         return {"object": "list", "data": [{"id": manager.model, "object": "model",
-                "created": int(time.time()), "owned_by": "agxinfer"}]}
+                "created": int(time.time()), "owned_by": "rsinfer"}]}
 
     @app.delete("/v1/requests/{uid}")
     async def cancel(uid: int) -> dict[str, Any]:
