@@ -59,7 +59,7 @@ def served(run: Path, *args: str, ready_s: float = 90) -> Generator[str]:
             assert time.monotonic() < deadline, "the engine did not come up"
             time.sleep(0.3)
         with urllib.request.urlopen(url + "/v1/models", timeout=10) as r:  # and it is this engine on that port
-            assert json.loads(r.read())["data"][0]["owned_by"] == "agxinfer", f"another server on port {port}"
+            assert json.loads(r.read())["data"][0]["owned_by"] == "rsinfer", f"another server on port {port}"
         yield url
     finally:
         os.killpg(proc.pid, signal.SIGTERM)

@@ -2,7 +2,7 @@
 
 给在本仓库工作的 agent：规矩、怎么验证。项目是什么见 [README.md](README.md)。
 
-**动手前先读 [`.claude/skills/agxinfer/SKILL.md`](.claude/skills/agxinfer/SKILL.md)**：东西在哪（目录地图），以及怎么在跑着的引擎上热改（Claude Code 会把它当 skill 自动加载）。
+**动手前先读 [`.claude/skills/rsinfer/SKILL.md`](.claude/skills/rsinfer/SKILL.md)**：东西在哪（目录地图），以及怎么在跑着的引擎上热改（Claude Code 会把它当 skill 自动加载）。
 
 ## 框架改动
 
@@ -30,13 +30,13 @@
   - 绝对导入 `tests.framework.…`，包括写在字符串里的代码（toy unit 源码、子进程的 `python -c "..."`）；
   - 用 `Path(__file__).parents[n]` 算出的路径：`tests/framework/cluster/harness.py` 的 `REPO`、`ipc/test_shm_ring_wrap.py`、`ipc/test_location_transparency.py`、`formal/run.py` 和 `formal/test_*.py`；
   - `pyproject.toml`（`testpaths`、`addopts`、pyright `include`）和 `.github/workflows/ci.yml`；
-  - `.claude/skills/agxinfer/SKILL.md` 的目录地图。其他文档不必逐个追改（见下一节）。
+  - `.claude/skills/rsinfer/SKILL.md` 的目录地图。其他文档不必逐个追改（见下一节）。
 
 ## 文档是开发笔记
 
 - `doc/` 下的文档和各目录的 README 是带日期的开发笔记，记录的是写下当时的想法，不是必须一直保持正确的规范。
 - 改代码时**不要**连带更新所有引用到它的文档，也不要为了让旧文档保持最新花大量精力。需要记录新的结论时，写一份带日期的新文档；新文档可以取代旧文档。
-- 只有两类文档需要和代码保持一致：这次改动直接对应的文档（例如你正在写的设计或评估记录），以及本文件和 `.claude/skills/agxinfer/SKILL.md`（目录地图、热改的做法）。
+- 只有两类文档需要和代码保持一致：这次改动直接对应的文档（例如你正在写的设计或评估记录），以及本文件和 `.claude/skills/rsinfer/SKILL.md`（目录地图、热改的做法）。
 
 ## 常用命令
 
@@ -47,7 +47,7 @@ uv run pytest                        # 默认测试；不收集 tests/framework/
 uv run pytest -n 8                   # 全量并行（pytest-xdist）：约 30 秒，串行约 165 秒
 uv run pytest tests/framework/ipc -q # 只跑某个目录
 # 起引擎、热改、停引擎：uv run python deploy/agxinfer.py serve|control|status|stop|sleep|wake ...
-#   见 .claude/skills/agxinfer/SKILL.md「在跑着的引擎上热改」和 deploy/README.md
+#   见 .claude/skills/rsinfer/SKILL.md「在跑着的引擎上热改」和 deploy/README.md
 # formal 全流程：需要 Java 11+；首次 --bootstrap 下载并校验 TLC 1.7.4
 uv run python tests/framework/formal/run.py --bootstrap --replay [--java /path/to/java]
 ```

@@ -33,7 +33,10 @@ def test_completions_and_chat_use_the_real_units_and_record_streams(serving: tup
     url, scheduler = serving
     with httpx.Client(base_url=url, timeout=10) as client:
         assert client.get("/health").json() == {"status": "ok"}
-        assert client.get("/v1/models").json()["data"][0]["id"] == "toy"
+        assert client.get("/openapi.json").json()["info"]["title"] == "rsinfer"
+        model = client.get("/v1/models").json()["data"][0]
+        assert model["id"] == "toy"
+        assert model["owned_by"] == "rsinfer"
         for path, body, chat in [
             ("/v1/completions", {"prompt": "hello"}, False),
             ("/v1/chat/completions", {"messages": [{"role": "user", "content": "hello"}]}, True),
