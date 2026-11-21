@@ -1,17 +1,19 @@
-# DS1017 Benchmark 与 AgentX 数据集脚本使用说明（`exp/agentx-opt` / Wave 6A）
+# DS1017 and AgentX benchmarks on `exp/agentx-opt` (Wave 6A)
 
-本目录包含可直接登录 GPU 物理机一键运行的评测脚本（4×SM100，DP4/EP4），覆盖：
+[English](README.md) | [简体中文](README_zh.md)
 
-1. **DS1017 官方 Prefill / Decode Benchmark**（`agxinfer` 与原版 `DeepInfer` 对照）
-2. **AgentX 数据集生成与回放 Benchmark**（默认启用 Wave 6A 的 NVLink5 词表并行贪心 LM Head 与多流 decode overlap 优化）
+Run the scripts from the repository root on a host with four SM100 GPUs (DP4/EP4). This branch supports:
 
-> 所有临时测量探针都会自动拷贝到 `.runs/` 下的隔离副本里执行并在结束后清理，**不会修改你的 git 工作树**。
+1. The official DS1017 prefill and decode sweeps against stock DeepInfer. Use the decode sweep for Figure 6(b).
+2. AgentX dataset preparation and replay with the Wave 6A NVLink5 vocabulary-parallel greedy LM head and multi-stream decode overlap enabled by default for applicable workloads.
+
+The benchmark stages measurement probes in a disposable source copy under `.runs/`. Successful default runs clean up the copy.
 
 ---
 
-## 0. 环境准备
+## 1. Set up the environment
 
-- 4 张空闲 SM100 GPU（`--gpus 0,1,2,3` 或 `GPUS`）；DS1017 权重目录（`--model` 或 `AGX_MODEL`）；Python 默认使用当前激活环境（也可 `--python` / `AGX_PY` 指定），自动补齐 `nvidia.cu13` 头文件与 `nvcc`。
+Select four available GPUs with `--gpus 0,1,2,3` or `GPUS` and supply the DS1017 checkpoint via `--model` or `AGX_MODEL`. The scripts select the active Python environment and detect the CUDA compiler and `nvidia.cu13` headers. To override the Python interpreter, use `--python` or `AGX_PY`.
 
 ```bash
 BENCH=tests/gpu/ds1017_bench
@@ -20,33 +22,33 @@ export AGX_MODEL=/path/to/DeepSeek-V4.1-Flash-1017
 
 ---
 
-## 1. DS1017 官方 Prefill & Decode Benchmark
+## 2. Official DS1017 prefill and decode sweeps
 
 ```bash
-# Prefill（可传单点如 65536，或不传跑全档 4096 8192 16384 32768 65536）
+# Measure 64K prefill. Omit the budget to sweep 4096, 8192, 16384, 32768, and 65536.
 "$BENCH/run_rsinfer_official.sh" prefill --model "$AGX_MODEL" --gpus 0,1,2,3 65536
 
-# Decode（可传单点如 256，或不传跑全档 4 8 16 32 64 128 256）
+# Measure decode at D=256/GPU. Omit D to sweep 4, 8, 16, 32, 64, 128, and 256.
 "$BENCH/run_rsinfer_official.sh" decode  --model "$AGX_MODEL" --gpus 0,1,2,3 256
 
-# 原版 DeepInfer 对照
+# Stock DeepInfer baselines
 "$BENCH/run_di_official.sh" prefill --model "$AGX_MODEL" --di-root /path/to/DeepInfer --gpus 0,1,2,3 65536
 "$BENCH/run_di_official.sh" decode  --model "$AGX_MODEL" --di-root /path/to/DeepInfer --gpus 0,1,2,3 256
 ```
 
 ---
 
-## 2. AgentX 数据集生成与回放 Benchmark
+## 3. Prepare and replay AgentX
 
 ```bash
-# 生成 131K（默认）或 256K（加 --max-context 262144）数据集
+# Prepare the 131K dataset. Add --max-context 262144 to prepare the 256K dataset.
 "$BENCH/run_agentx.sh" prepare --model "$AGX_MODEL" /path/to/cc-traces-weka-062126-256k.jsonl ./agentx-data-131k
 
-# 回放（默认 16 24 48；也可传单点如 32；256K 集加 --max-context 262144）
+# Replay at C=32. The default sweep is 16, 24, 48. For the 256K dataset, add --max-context 262144.
 "$BENCH/run_agentx.sh" run-agx --model "$AGX_MODEL" --gpus 0,1,2,3 ./agentx-data-131k/agentx_eval 32
 
-# 原版 DeepInfer 对照
+# Stock DeepInfer replay
 "$BENCH/run_agentx.sh" run-di  --model "$AGX_MODEL" --di-root /path/to/DeepInfer --gpus 0,1,2,3 ./agentx-data-131k/agentx_eval 32
 ```
 
-结果默认保存在 `.runs/results/`（可用 `--out <DIR>` 指定）。
+Results go to `.runs/results/` by default. Use `--out <DIR>` to select another directory.
