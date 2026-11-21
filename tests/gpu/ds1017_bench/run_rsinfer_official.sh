@@ -5,14 +5,14 @@
 # disposable staged copy so the git working tree stays completely clean.
 #
 # Usage:
-#   ./run_agx_official.sh prefill --model <MODEL_DIR> [OPTIONS] [BUDGET ...]
+#   ./run_rsinfer_official.sh prefill --model <MODEL_DIR> [OPTIONS] [BUDGET ...]
 #       Default budgets: 4096 8192 16384 32768 65536
-#   ./run_agx_official.sh decode  --model <MODEL_DIR> [OPTIONS] [D ...]
+#   ./run_rsinfer_official.sh decode  --model <MODEL_DIR> [OPTIONS] [D ...]
 #       Default concurrencies (per GPU): 4 8 16 32 64 128 256
-#   ./run_agx_official.sh serve-prefill --model <MODEL_DIR> [OPTIONS]
-#   ./run_agx_official.sh serve-decode  --model <MODEL_DIR> [OPTIONS]
-#   ./run_agx_official.sh status --run <RUN_DIR> [--python <PY>]
-#   ./run_agx_official.sh stop   --run <RUN_DIR> [--python <PY>]
+#   ./run_rsinfer_official.sh serve-prefill --model <MODEL_DIR> [OPTIONS]
+#   ./run_rsinfer_official.sh serve-decode  --model <MODEL_DIR> [OPTIONS]
+#   ./run_rsinfer_official.sh status --run <RUN_DIR> [--python <PY>]
+#   ./run_rsinfer_official.sh stop   --run <RUN_DIR> [--python <PY>]
 #
 # Options (all can also be passed via environment variables):
 #   --model <DIR>        DS1017 model directory (env: AGX_MODEL / MODEL_DIR)

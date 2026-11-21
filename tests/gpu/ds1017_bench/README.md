@@ -24,10 +24,10 @@ export AGX_MODEL=/path/to/DeepSeek-V4.1-Flash-1017
 
 ```bash
 # Prefill（可传单点如 65536，或不传跑全档 4096 8192 16384 32768 65536）
-"$BENCH/run_agx_official.sh" prefill --model "$AGX_MODEL" --gpus 0,1,2,3 65536
+"$BENCH/run_rsinfer_official.sh" prefill --model "$AGX_MODEL" --gpus 0,1,2,3 65536
 
 # Decode（可传单点如 256，或不传跑全档 4 8 16 32 64 128 256）
-"$BENCH/run_agx_official.sh" decode  --model "$AGX_MODEL" --gpus 0,1,2,3 256
+"$BENCH/run_rsinfer_official.sh" decode  --model "$AGX_MODEL" --gpus 0,1,2,3 256
 
 # 原版 DeepInfer 对照
 "$BENCH/run_di_official.sh" prefill --model "$AGX_MODEL" --di-root /path/to/DeepInfer --gpus 0,1,2,3 65536
