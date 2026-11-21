@@ -19,7 +19,7 @@ uv build --wheel third_party/aka-ds1017-kernels --out-dir dist
 python -m pip install --no-deps dist/aka_ds1017_kernels-0.1.0-py3-none-any.whl
 ```
 
-`run_agx_official.sh` 与 `run_agentx.sh` 支持 `--aka-profile <auto|official|validated|expanded>`（默认 `auto`：检测到已安装 `aka_ds1017` 自动选 `validated`，否则回退 `official`）、`--aka-disable`、`--aka-cache <DIR>` 与 `--aka-warmup`。
+`run_rsinfer_official.sh` 与 `run_agentx.sh` 支持 `--aka-profile <auto|official|validated|expanded>`（默认 `auto`：检测到已安装 `aka_ds1017` 自动选 `validated`，否则回退 `official`）、`--aka-disable`、`--aka-cache <DIR>` 与 `--aka-warmup`。
 
 ```bash
 BENCH=tests/gpu/ds1017_bench
@@ -34,10 +34,10 @@ export AGX_MODEL=/path/to/DeepSeek-V4.1-Flash-1017
 
 ```bash
 # Prefill 64K（首次可加 --aka-warmup 预编译扩展；不传档位则跑 4096 8192 16384 32768 65536）
-"$BENCH/run_agx_official.sh" prefill --model "$AGX_MODEL" --gpus 0,1,2,3 --aka-profile validated --aka-warmup 65536
+"$BENCH/run_rsinfer_official.sh" prefill --model "$AGX_MODEL" --gpus 0,1,2,3 --aka-profile validated --aka-warmup 65536
 
 # Decode D=256（不传档位则跑 4 8 16 32 64 128 256）
-"$BENCH/run_agx_official.sh" decode  --model "$AGX_MODEL" --gpus 0,1,2,3 --aka-profile validated 256
+"$BENCH/run_rsinfer_official.sh" decode  --model "$AGX_MODEL" --gpus 0,1,2,3 --aka-profile validated 256
 
 # 原版 DeepInfer 对照
 "$BENCH/run_di_official.sh" prefill --model "$AGX_MODEL" --di-root /path/to/DeepInfer --gpus 0,1,2,3 65536

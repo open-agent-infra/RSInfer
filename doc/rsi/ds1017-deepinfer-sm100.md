@@ -42,7 +42,7 @@ python -m aka_ds1017 warmup --profile validated --budget 32768
 
 ## 复现端到端计时
 
-在两种配置的独立实验快照中使用相同的逐步计数和 top-5 采集探针。仓库的[官方测量脚本](../../tests/gpu/ds1017_bench/run_agx_official.sh)中包含这些探针的准备方式。服务设置为 DP4/EP4、实际路由（`deepinfer.force_random_gate=false`）、`yoco-clip=140`，两侧使用相同的图配置和采样设置。切换预算后先清空 radix cache，再开启缓存。
+在两种配置的独立实验快照中使用相同的逐步计数和 top-5 采集探针。仓库的[官方测量脚本](../../tests/gpu/ds1017_bench/run_rsinfer_official.sh)中包含这些探针的准备方式。服务设置为 DP4/EP4、实际路由（`deepinfer.force_random_gate=false`）、`yoco-clip=140`，两侧使用相同的图配置和采样设置。切换预算后先清空 radix cache，再开启缓存。
 
 下例使用每卡 32K 预算。先将部署的 `sched.token_budget` 与 `BUDGET` 设为相同值，`RUN_DIR` 指向正在运行的引擎目录，`MODEL_DIR` 指向权重目录。每轮使用单独的结果文件。
 
