@@ -91,7 +91,8 @@ class RequestState:
 class FrontendManager:
     def __init__(self, model: str, tokenizer: Tokenizer, detokenizer: Detokenizer, channel: Channel,
                  identity: Callable[[], str], *, max_tokens: int = 4096, max_requests: int = 1024,
-                 response_timeout_s: float = 120.0, paused: Callable[[], bool] = lambda: False) -> None:
+                 cache: Any = None, response_timeout_s: float = 120.0, paused: Callable[[], bool] = lambda: False) -> None:
+        self.cache = cache if cache is not None and cache.enabled else None
         self.model, self.tokenizer, self.detokenizer, self.channel = model, tokenizer, detokenizer, channel
         self._model_json = json.dumps(model, ensure_ascii=False)
         self.identity, self.max_tokens, self.max_requests = identity, max_tokens, max_requests
@@ -260,6 +261,7 @@ class FrontendManager:
             prompt = await asyncio.to_thread(self.tokenizer.encode, request.prompt)
         if not prompt:
             raise HTTPException(400, "tokenized prompt must not be empty")
+        cached = await asyncio.to_thread(self.cache.lookup, prompt) if self.cache is not None else None
         if len(self.states) >= self.max_requests:
             raise HTTPException(503, "frontend request capacity reached")
         uid = self.uid_counter
@@ -269,7 +271,7 @@ class FrontendManager:
         self.states[uid] = RequestState(self.detokenizer.open(stops), len(prompt), identity, identities=[identity])
         new = NewRequest(uid, Column.of("i64", prompt),
                          SamplingParams(request.temperature, request.top_p, request.top_k, request.seed),
-                         request.max_tokens, [] if request.ignore_eos else list(self.tokenizer.stop_token_ids))
+                         request.max_tokens, [] if request.ignore_eos else list(self.tokenizer.stop_token_ids), cached)
         try:
             sent = await self.channel.send(Requests(new=[new]))
         except asyncio.CancelledError:

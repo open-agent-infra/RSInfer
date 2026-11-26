@@ -77,7 +77,8 @@ class Unit:
                                   lambda: str(control.identity), max_tokens=config["frontend.max_tokens"],
                                   max_requests=config["frontend.max_requests"],
                                   response_timeout_s=config["frontend.response_timeout_s"],
-                                  paused=lambda: bool(getattr(control, "paused", False)))
+                                  paused=lambda: bool(getattr(control, "paused", False)),
+                                  cache=ctx.get("kv.cache@1"))
         server = Server(manager, config["frontend.http_bind"], config["frontend.http_port"],
                         config["frontend.start_timeout_s"], config["frontend.shutdown_timeout_s"])
         ctx.effect(server.start, "HTTP server and record streams")

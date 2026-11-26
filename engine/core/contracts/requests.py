@@ -10,6 +10,7 @@ from typing import ClassVar, Literal
 
 import msgspec
 
+from core.contracts.cache import CacheRef
 from core.contracts.columns import Column
 from core.contracts.sampling import SamplingParams
 
@@ -32,6 +33,8 @@ class NewRequest(msgspec.Struct, frozen=True):
     sampling: SamplingParams = SamplingParams()
     max_tokens: int = 256
     stop_token_ids: list[int] = []
+    cache: CacheRef | None = None
+    """An optional published prefix, restored before the first forward."""
 
 
 class AbortRequest(msgspec.Struct, frozen=True):

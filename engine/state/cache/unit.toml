@@ -1,0 +1,27 @@
+[unit]
+id = "state.cache"
+kind = "logic"
+process = ["frontend", "sched", "worker"]
+entry = "state.cache.unit:Unit"
+
+[provides]
+services = ["kv.cache@1"]
+
+[requires]
+services = ["proc.control@1"]
+
+[reads]
+config = ["alloc.radix_cache", "alloc.states", "spec.algorithm", "sched.overlap", "sched.workers", "sched.domains", "state.kv.page_size", "model.dtype", "state.kv.dtype", "state.gdn.conv_dtype", "state.gdn.ssm_dtype", "model.hf_config", "model.path", "weights.path"]
+
+[config]
+"cache.backend" = { type = "str", default = "", binding = "startup", doc = "Empty disables remote cache; mooncake enables Store snapshots." }
+"cache.model_id" = { type = "str", default = "", binding = "startup", doc = "Optional namespace salt; checkpoint/config/code are fingerprinted automatically. Change it to reload the cache after a hot edit." }
+"cache.hostname" = { type = "str", default = "", binding = "startup", doc = "This client's network address, reachable by other Mooncake clients." }
+"cache.mooncake_master" = { type = "str", default = "", binding = "startup", doc = "Mooncake master host:port." }
+"cache.metadata_server" = { type = "str", default = "P2PHANDSHAKE", binding = "startup" }
+"cache.protocol" = { type = "str", default = "tcp", binding = "startup", doc = "TCP host staging by default; rdma requires an independently configured RDMA deployment." }
+"cache.rdma_devices" = { type = "str", default = "", binding = "startup" }
+"cache.segment_bytes" = { type = "int", default = 268435456, binding = "startup", doc = "Store memory contributed by each client process." }
+"cache.buffer_bytes" = { type = "int", default = 67108864, binding = "startup" }
+"cache.max_bytes" = { type = "int", default = 67108864, binding = "startup", doc = "Maximum serialized snapshot, including metadata." }
+"cache.timeout_s" = { type = "float", default = 10.0, binding = "startup", doc = "Deadline for a cache RPC or waiting for its I/O queue." }

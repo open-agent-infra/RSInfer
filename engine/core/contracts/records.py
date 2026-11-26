@@ -15,6 +15,7 @@ from typing import ClassVar, Literal
 
 import msgspec
 
+from core.contracts.cache import CacheRef, CacheSave
 from core.contracts.columns import Column
 from core.contracts.sampling import SamplingParams
 
@@ -32,6 +33,7 @@ class AddedRow(msgspec.Struct, frozen=True):
     """Index into the worker's persistent batch (``worker.batch``)."""
     request: int
     sampling: SamplingParams = SamplingParams()
+    cache: CacheRef | None = None
 
 
 class RowDelta(msgspec.Struct, frozen=True):
@@ -137,6 +139,7 @@ class StateOps(msgspec.Struct, frozen=True):
     assign: list[StateAssign] = []
     copy: list[StateCopy] = []
     track: list[StateTrack] = []
+    save: list[CacheSave] = []
 
 
 # ------------------------------------------------------------------ worker -> scheduler
@@ -154,6 +157,8 @@ class Sampled(msgspec.Struct, frozen=True):
     rows: Column
     counts: Column
     tokens: Column
+    errors: dict[int, str] = {}
+    """Rows whose restore failed before forward; zero count, no output, other rows still run."""
 
 
 class StepStats(msgspec.Struct, frozen=True):

@@ -82,20 +82,21 @@ def test_units_may_import_the_contracts_and_the_contracts_pass_the_rules(tmp_pat
 
 
 REACHES: dict[str, set[str]] = {
+    "cache": set(),
     "columns": set(),
     "tensor": set(),
     "sampling": set(),
-    "requests": {"columns", "sampling"},  # frontend <-> scheduler
+    "requests": {"cache", "columns", "sampling"},  # frontend <-> scheduler
     "serving": set(),  # where the scheduler sends a frontend its tokens
-    "records": {"columns", "sampling"},  # scheduler <-> worker
+    "records": {"cache", "columns", "sampling"},  # scheduler <-> worker
     "ledger": set(),  # scheduler -> its ledger
     "policy": set(),  # scheduler -> its policy units
     "state": set(),
     "storage": {"state", "tensor"},  # storage unit <-> its users in the worker
     "kernels": set(),
     "model": {"state", "tensor"},
-    "plan": {"columns", "records", "sampling", "state", "tensor"},
-    "execution": {"columns", "records", "sampling"},  # worker loop <-> executor
+    "plan": {"cache", "columns", "records", "sampling", "state", "tensor"},
+    "execution": {"cache", "columns", "records", "sampling"},  # worker loop <-> executor
 }
 """Every contract module, and the other contract modules its imports reach (stage2-contract.md §3)."""
 

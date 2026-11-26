@@ -8,6 +8,7 @@ entry = "core.sched.unit:Unit"
 services = ["proc.loop@1", "sched.status@1"]
 
 [requires]
+optional = ["kv.cache@1"]
 services = ["sched.reqs@1", "ledger.domains@1", "policy.order@1", "policy.compose@1", "proc.streams@1", "proc.control@1"]
 
 [capabilities]

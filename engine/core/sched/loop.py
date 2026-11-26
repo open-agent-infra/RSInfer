@@ -74,6 +74,7 @@ from typing import Any, Literal, Protocol, cast
 
 import msgspec
 
+from core.contracts.cache import CacheSave
 from core.contracts.columns import Column, ragged
 from core.contracts.ledger import Ledger
 from core.contracts.policy import Candidate, ComposePolicy, OrderPolicy, StepView, Take
@@ -275,7 +276,8 @@ class Scheduler:
                  prefill_interval: Callable[[], int] = lambda: 0,
                  prefill_occupancy_target: Callable[[], int] = lambda: 0,
                  balance_prefill: Callable[[], bool] = lambda: False,
-                 settings: Settings = Settings(), clock: Callable[[], float] = time.monotonic) -> None:
+                 cache: Any = None, settings: Settings = Settings(), clock: Callable[[], float] = time.monotonic) -> None:
+        self.cache = cache if cache is not None and cache.enabled else None
         if not plans or len(plans) != len(results):
             raise ValueError("one plan writer and one result reader per rank")
         if settings.max_batch < 1 or settings.token_budget < 1:
@@ -731,6 +733,12 @@ class Scheduler:
                     self._prefill_tok_s = 0.7 * self._prefill_tok_s + 0.3 * rate
             else:
                 self._decode_step_s = 0.8 * self._decode_step_s + 0.2 * min(gpu_s, 0.2)
+        for domain in ran:
+            answer = cast(Sampled, answers[self.domains[domain][0]])
+            for row, reason in answer.errors.items():
+                request = self.table.get(flight.rows[row + domain * self.settings.max_batch])
+                if request is not None:
+                    self._error(request, reason)
         events = self.table.sample(flight.epoch, self.identity(), merged) if ran else None
         for domain, ledger in enumerate(self.ledgers):
             if domain in ran:
@@ -795,7 +803,9 @@ class Scheduler:
         s_counts = cast(Sequence[int], sampled.counts.values())
         s_tokens = cast(Sequence[int], sampled.tokens.values())
         n_r = len(s_rows)
-        if n_r != len(s_counts):
+        if n_r != len(s_counts) or any(n < 0 for n in s_counts):
+            return None
+        if any(row not in s_rows or s_counts[list(s_rows).index(row)] != 0 for row in sampled.errors):
             return None
         if len(flight.samples) == len(flight.rows) and len(s_tokens) == n_r and all(c == 1 for c in s_counts):
             f_rows = flight.rows
@@ -913,6 +923,10 @@ class Scheduler:
         requests = cast(Requests, parts[Requests.SECTION])
         route = cast(ReturnRoute, parts[ReturnRoute.SECTION]).tokens
         for new in requests.new:
+            if new.cache is not None and (self.cache is None or not 0 < new.cache.tokens < len(new.prompt)
+                    or self.cache.ref(new.prompt.values(), new.cache.tokens) != new.cache):
+                self._refuse(route, new.request, "invalid or incompatible cache reference")
+                continue
             if self.drain_mode == "force":
                 self._refuse(route, new.request, FORCED)
                 continue
@@ -1181,7 +1195,8 @@ class Scheduler:
             room[domain] -= 1
             queued[domain] += len(prompt)
             return domain, 0
-        matches = {d: self.ledgers[d].match(rid, prompt) for d in open_}
+        matches = {d: (request.input.cache.tokens if request.input.cache is not None
+                       else self.ledgers[d].match(rid, prompt)) for d in open_}
         domain = (max(open_, key=lambda d: (d != self.turned_away.get(rid), matches[d], -queued[d], room[d], -d))
                   if balance else max(open_, key=lambda d: (d != self.turned_away.get(rid), matches[d], room[d], -d)))
         room[domain] -= 1
@@ -1392,7 +1407,9 @@ class Scheduler:
                 # Where it would start now (an admission before it in this step may have evicted
                 # part of its prefix): a chunk that reaches no page does not run, and admitting it
                 # would only evict from the cache (Antigravity, #59; PrefillAdder checks first too).
-                if self._chunk(request, ledger.match(rid, request.prompt_tokens), take.tokens) <= 0:
+                cached = request.input.cache
+                prefix = cached.tokens if cached is not None else ledger.match(rid, request.prompt_tokens)
+                if self._chunk(request, prefix, take.tokens) <= 0:
                     continue
                 got = ledger.admit(rid, request.prompt_tokens, extent, step.epoch)
                 if got is None:
@@ -1401,9 +1418,9 @@ class Scheduler:
                     continue
                 self.turned_away.pop(rid, None)
                 request.row = free.pop(0)
-                request.computed = planned = got.prefix  # the cached prefix is computed
+                request.computed = planned = cached.tokens if cached is not None else got.prefix
                 step.admitted.append(request)
-                step.added.append(AddedRow(request.row, rid, request.input.sampling))
+                step.added.append(AddedRow(request.row, rid, request.input.sampling, cached))
                 step.assign_all(request.row, got.items)
             row = request.row
             assert row is not None
@@ -1460,6 +1477,9 @@ class Scheduler:
         admission may start further on than the view did). A chunk that does not end its prompt
         ends on a page: the cache keeps whole pages (PrefillAdder: end = (prefix_len + extend_len)
         // page_size * page_size). 0 or less: nothing runs."""
+        if self.cache is not None:
+            end = self.cache.prefill_end(planned, planned + tokens, len(request.prompt_tokens))
+            tokens = end - planned
         left = len(request.prompt_tokens) - planned
         n = min(tokens, left)
         if n < left:
@@ -1476,7 +1496,9 @@ class Scheduler:
             for request in self.table.entries():
                 if request.row is not None and not request.finished():
                     step = steps[self._domain(request.row)]
-                    step.added.append(AddedRow(request.row, request.input.request, request.input.sampling))
+                    step.added.append(AddedRow(request.row, request.input.request, request.input.sampling,
+                                               request.input.cache if request.input.cache is not None and
+                                               request.computed == request.input.cache.tokens else None))
                     step.assign_all(request.row, self._ledger(request).items(request.input.request))
         records = [self._record(step) for step in steps]
         rows = {row: rid for step in steps for row, rid in step.rows.items()}
@@ -1518,7 +1540,16 @@ class Scheduler:
                                      Column.of("i32", [t[2] for t in ts])) for kind, ts in step.track.items()])
         removed = [] if self.full else [row - base for row in self.removed
                                         if base <= row < base + self.settings.max_batch]
-        delta = RowDelta([AddedRow(a.row - base, a.request, a.sampling) for a in step.added],
+        if self.cache is not None:
+            saves: list[CacheSave] = []
+            for row, start in zip(step.rows, step.positions, strict=True):
+                request = self.table.get(step.rows[row])
+                assert request is not None
+                end = start + step.counts[row]
+                if row in step.prefill_rows and end < len(request.prompt_tokens) and end % self.cache.page_size == 0:
+                    saves.append(CacheSave(row - base, self.cache.ref(request.prompt_tokens, end)))
+            state = msgspec.structs.replace(state, save=saves)
+        delta = RowDelta([AddedRow(a.row - base, a.request, a.sampling, a.cache) for a in step.added],
                          Column.of("i32", removed), self.full)
         return (RecordBuilder(STEP_PLAN, step.epoch).add(RowDelta.SECTION, delta)
                 .add(BatchPlan.SECTION, batch).add(StateOps.SECTION, state).build())

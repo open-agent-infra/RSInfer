@@ -8,6 +8,7 @@ entry = "frontend.http.unit:Unit"
 services = ["frontend.http@1"]
 
 [requires]
+optional = ["kv.cache@1"]
 services = ["frontend.tokenizer@1", "frontend.detok@1", "proc.control@1", "proc.streams@1"]
 
 [capabilities]

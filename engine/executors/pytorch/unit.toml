@@ -8,6 +8,7 @@ entry = "executors.pytorch.unit:Unit"
 services = ["executor@1"]
 
 [requires]
+optional = ["kv.cache@1"]
 services = ["worker.batch@1", "plan@1", "layers.sampler@1", "model@1"]
 
 [config]

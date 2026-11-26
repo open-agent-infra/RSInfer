@@ -28,9 +28,10 @@ from __future__ import annotations
 
 import time
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field, replace
 from typing import Any
 
+import msgspec
 import torch
 
 from core.contracts.columns import Column
@@ -104,6 +105,8 @@ class Step:
     sample_mask: list[bool] | None = None
     """Without speculation, rows that need a sampled token; ``None`` means every row."""
 
+    errors: dict[int, str] = field(default_factory=dict[int, str])
+
     def ready(self) -> bool:
         return self.end.passed()
 
@@ -113,10 +116,11 @@ class Step:
             counts = (Column("i32", b"\x01\x00\x00\x00" * len(self.rows)) if self.sample_mask is None
                       else Column.of("i32", [int(v) for v in self.sample_mask]))
             return Sampled(Column.of("i32", self.rows), counts,
-                           Column.of("i64", self.tokens.tolist()))
+                           Column.of("i64", self.tokens.tolist()), self.errors)
         counts = [int(n) for n in self.counts.tolist()]
-        tokens = [int(t) for row, n in zip(self.tokens.tolist(), counts, strict=True) for t in row[:n]]
-        return Sampled(Column.of("i32", self.rows), Column.of("i32", counts), Column.of("i64", tokens))
+        tokens = ([int(t) for t in self.tokens.tolist()] if self.tokens.ndim == 1 else
+                  [int(t) for row, n in zip(self.tokens.tolist(), counts, strict=True) for t in row[:n]])
+        return Sampled(Column.of("i32", self.rows), Column.of("i32", counts), Column.of("i64", tokens), self.errors)
 
     def stats(self) -> StepStats:
         """``device_us`` spans the step's device work, gaps between its kernels included;
@@ -153,13 +157,38 @@ def check_plan(plan: BatchPlan) -> None:
         raise ValueError("tokens is an i64 column")
 
 
+def without_rows(plan: BatchPlan, excluded: set[int]) -> BatchPlan:
+    """Keep the other rows and their flat token slices without changing their order."""
+    keep: list[int] = []
+    tokens: list[int] = []
+    offset = 0
+    flat = plan.tokens.values()
+    for i, (row, count, previous) in enumerate(zip(plan.rows.values(), plan.num_tokens.values(),
+                                                  plan.from_previous.values(), strict=True)):
+        n = 0 if previous else int(count)
+        if int(row) not in excluded:
+            keep.append(i)
+            tokens.extend(int(x) for x in flat[offset:offset + n])
+        offset += n
+
+    def select(column: Column) -> Column:
+        return Column.of(column.dtype, [column.values()[i] for i in keep]) if len(column) else column
+
+    return msgspec.structs.replace(plan, rows=select(plan.rows), num_tokens=select(plan.num_tokens),
+                                   positions=select(plan.positions), tokens=Column.of("i64", tokens),
+                                   from_previous=select(plan.from_previous), next_tokens=select(plan.next_tokens),
+                                   prompt_lengths=select(plan.prompt_lengths))
+
+
 class PyTorchExecutor:
     """``executor@1``."""
 
     def __init__(self, platform: Any, batch: Any, plans: PlanService, sampler: Any, stores: dict[str, Any],
                  spec: Speculative | None = None, idle: Callable[[], None] | None = None,
-                 stepped: Callable[[], None] | None = None) -> None:
+                 stepped: Callable[[], None] | None = None, cache: Any = None, model: Any = None) -> None:
         self.platform, self.batch, self.plans, self.sampler, self.stores = platform, batch, plans, sampler, stores
+        self.cache = cache if cache is not None and cache.enabled else None
+        self.model = model
         self.spec = spec
         """Speculation (doc/specs/mtp.md); ``None`` off."""
         self.idle = idle
@@ -216,12 +245,49 @@ class PyTorchExecutor:
         begin = self._mark(device)
         self.batch.apply(delta, state)
         try:
+            if self.cache is not None:
+                return self._cached(epoch, delta, plan, state, chosen, eager, last_token, begin, start)
+            if any(a.cache is not None for a in delta.added) or state.save:
+                raise ValueError("cache instructions reached a worker without a cache service")
             return self._run(epoch, plan, state, chosen, eager, last_token, begin, start)
         except BaseException:
             # The batch is changed and the step did not finish: a step sent after this one (with
             # sched.overlap) would run on half-changed tables. Refuse those until a full delta.
             self.batch.invalidate()
             raise
+
+    def _cached(self, epoch: int, delta: RowDelta, plan: BatchPlan, state: StateOps, chosen: Plan, eager: Plan,
+                last_token: torch.Tensor, begin: Mark, start: float) -> Step:
+        assert self.cache is not None
+        errors: dict[int, str] = {}
+        for added in delta.added:
+            if added.cache is not None:
+                try:
+                    self.cache.load(added.cache, self.model, self.batch, added.row)
+                except Exception as exc:
+                    errors[added.row] = f"cache restore failed: {exc}"
+        original = [int(r) for r in plan.rows.values()]
+        working = without_rows(plan, set(errors)) if errors else plan
+        if len(working.rows):
+            step = self._run(epoch, working, state, chosen, eager, last_token, begin, start)
+        else:
+            end = self._mark(last_token.device)
+            step = Step([], torch.empty(0, dtype=torch.int64), epoch, 0, begin, end, self.last_end,
+                        torch.empty(0), torch.empty(0, dtype=torch.int32))
+            self.last_end = end
+        for save in state.save:
+            if save.row not in errors:
+                try:
+                    self.cache.save(save.ref, self.model, self.batch, save.row)
+                except Exception as exc:
+                    # A failed backup never invalidates the live request's own state.
+                    self.cache.note("publish_failed", str(exc))
+        if errors:
+            result = step.finish()
+            counts = dict(zip((int(r) for r in result.rows.values()), (int(n) for n in result.counts.values()), strict=True))
+            step = replace(step, rows=original, counts=torch.tensor([counts.get(r, 0) for r in original]),
+                           sample_mask=None, errors=errors)
+        return replace(step, host_us=(time.perf_counter() - start) * 1e6)
 
     def _empty(self, epoch: int, delta: RowDelta, plan: BatchPlan, state: StateOps, start: float) -> Step | Resync:
         """A step without rows on this rank."""
@@ -427,4 +493,5 @@ class Unit:
                 eager_idle()
 
         ctx.provide("executor@1", PyTorchExecutor(ctx.platform, batch, plans, sampler, stores, spec,
-                                                  idle if eager_idle is not None else None, getattr(model, "stepped", None)))
+                                                  idle if eager_idle is not None else None, getattr(model, "stepped", None),
+                                                  ctx.get("kv.cache@1"), model))

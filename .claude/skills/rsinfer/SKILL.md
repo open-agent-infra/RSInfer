@@ -117,6 +117,8 @@ worker 里的执行层单元（阶段 2，eager 和 TP1 decode graph，`stage2-c
 - 模型层的三个钩子（都是可选的方法，没有就不调）：`model.idle()`（executor 收到空计划时）、`model.stepped()`（每个 forward 之后、graph 之外：EPLB 计数）、backend 的 `fetch(input_ids, positions)`（`core.plan` 在 `prepare` 之后、forward 或回放之前调：多 rank 时取 Engram 的行）。
 - 记录：[doc/rsi/2026-11-15-ds1017-several-gpus.md](../../../doc/rsi/2026-11-15-ds1017-several-gpus.md)；没做完的在 specs 的 10.8 节。
 
+`engine/state/cache/`：可选 Mooncake Store 前缀快照服务（`kv.cache@1`），主机暂存、完整 KV/GDN 状态验证和有期限的 I/O 子进程；设计与适用边界见 `doc/specs/2026-11-26-mooncake-pd.md`。
+
 ### `tests/`
 
 - `tests/__init__.py`：让 `tests` 成为包。所有测试辅助代码都用 `tests.…` 绝对导入。

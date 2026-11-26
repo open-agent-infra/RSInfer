@@ -57,7 +57,7 @@ class Unit:
             prefill_interval=lambda: int(config["sched.prefill_interval"]),
             prefill_occupancy_target=lambda: int(config["sched.prefill_occupancy_target"]),
             balance_prefill=lambda: bool(config["sched.balance_prefill"]),
-            settings=settings)
+            settings=settings, cache=ctx.get("kv.cache@1"))
         for key in ("sched.overlap", "sched.overlap_lead_s", "sched.prefill_coalesce_s",
                     "sched.prefill_interval", "sched.prefill_occupancy_target", "sched.balance_prefill"):
             ctx.on_config(key, lambda value: None)  # read when planning: no reload needed
