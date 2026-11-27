@@ -374,7 +374,6 @@ class Participant:
 
     def _advance(self, c: _Change) -> None:
         """One slice of every unfinished preparation; ``Prepared`` once all are done."""
-        t0 = time.monotonic()
         try:
             for item in list(c.slicing):
                 try:
@@ -387,9 +386,6 @@ class Participant:
             self._rollback(c)
             self._resume(c, rolled_back=True)
             return
-        # Work done for the coordinator does not count against its lease (as in on_prepare): its
-        # keepalives wait in the socket while a slice runs, and are read at the next safe point.
-        c.deadline += time.monotonic() - t0
         if not c.slicing:
             c.phase = "prepared"
             c.renew()
@@ -489,6 +485,7 @@ class Participant:
         c.drain_deadline = time.monotonic() + msg.timeout_s
         reply = c.drain_reply = self.host.rpc.defer()
         self._check_drain(c)  # may already resolve it
+        c.renew()  # work done inside this RPC does not expire the lease in the same safe point
         return reply
 
     def _check_drain(self, c: _Change) -> None:
@@ -528,15 +525,14 @@ class Participant:
         c.pause_after = msg.after_epoch
         reply = c.pause_reply = self.host.rpc.defer()
         self._check_pause(c)  # may already resolve it
+        c.renew()  # work done inside this RPC does not expire the lease in the same safe point
         return reply
 
     def _check_pause(self, c: _Change) -> None:
         # The steps the loop has started (device work, results not taken yet) finish first:
         # what Execute unloads must not still be in use, and finishing them may be what reaches
         # the agreed epoch (the last step of a follower whose leader has stopped).
-        t0 = time.monotonic()
         quiesced = self.host.quiesce()
-        c.deadline += time.monotonic() - t0  # as in _advance: not the coordinator's silence
         if isinstance(quiesced, Failed):
             c.phase = "prepared"  # still serving; the coordinator aborts
             if c.pause_reply is not None:
@@ -746,14 +742,19 @@ class Participant:
         c = self.change
         if c is None:
             return
+        # Check the lease before advancing a slice or quiescing: rpc.poll() has just drained any
+        # KeepAlives that arrived during the previous slice, so a slow slice does not false-expire
+        # while the coordinator is alive, and a silent coordinator still expires on real wall time.
+        if time.monotonic() > c.deadline:
+            self._lease_expired(c)
+            if self.change is not c:
+                return
         if c.phase == "preparing":
             self._advance(c)
         elif c.phase == "draining":
             self._check_drain(c)
         elif c.phase == "pausing":
             self._check_pause(c)
-        if self.change is c and time.monotonic() > c.deadline:
-            self._lease_expired(c)
 
     def _lease_expired(self, c: _Change) -> None:
         silent = f"heard nothing from the coordinator of change {c.id} for {c.timeout_s}s"

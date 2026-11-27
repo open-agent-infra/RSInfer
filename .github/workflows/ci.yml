@@ -6,8 +6,7 @@ on:
   pull_request:
 jobs:
   check:
-    # The organization's own Linux runners (shared organization runners), not GitHub's: hosted minutes are a
-    # quota. All four labels, so that the job stays off the pool's other machines.
+    # GitHub-hosted Linux runner.
     runs-on: ubuntu-latest
     env:
       # One torch thread per process. A runner's machine has many cores, and torch starts a thread
@@ -36,10 +35,10 @@ jobs:
             true|false) echo "framework=$framework" >> "$GITHUB_OUTPUT" ;;
             *) echo "unexpected answer: '$framework'"; exit 1 ;;
           esac
-      # 8 workers, not one per core: a runner shares its machine with other jobs.
+      # Each test may start several engine processes; leave room for them on the hosted runner.
       - name: pytest
         if: steps.scope.outputs.framework != 'false'
-        run: uv run pytest -n 8
+        run: uv run pytest -n 2
       - name: pytest without tests/framework (the framework did not change)
         if: steps.scope.outputs.framework == 'false'
-        run: uv run pytest -n 8 --ignore=tests/framework
+        run: uv run pytest -n 2 --ignore=tests/framework
