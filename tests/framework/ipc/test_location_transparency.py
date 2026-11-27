@@ -15,5 +15,7 @@ def test_no_local_addresses_in_engine_code() -> None:
         for p in sorted(ENGINE.rglob("*.py"))
         for i, line in enumerate(p.read_text().splitlines(), 1)
         if FORBIDDEN.search(line)
+        # Only the build session leader may signal its compilers. This PID check is local ownership.
+        and not (p == ENGINE / "core/change/build.py" and line.strip() == "owns_session = os.getpid() == sid")
     ]
     assert hits == []
