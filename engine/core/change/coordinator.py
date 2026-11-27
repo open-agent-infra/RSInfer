@@ -454,6 +454,7 @@ class Coordinator:
         calls = [self._call(pa.proc, Prepare(run.id, run.identity, pa, self.tun.coordinator_timeout_s),
                             timeout=self.tun.prepare_timeout_s) for pa in participants]
         if self.faults.take("vanish_during_prepare"):
+            self.faults.silence(run.id)
             await self.faults.send_then_vanish(calls)
             raise _Vanish("prepare")
         results = await asyncio.gather(*calls)

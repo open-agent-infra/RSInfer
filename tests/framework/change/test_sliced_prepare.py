@@ -224,13 +224,16 @@ def test_an_action_of_a_staged_unit_whose_provider_reloads_is_prepared_on_its_ne
 SLOW_SLICES = """
 import time
 
+from tests.framework.support import events
+
 
 class Unit:
     def __init__(self, ctx, config):
         ctx.on_action("work", self)
 
     def prepare(self, args):
-        for _ in range(2):
+        for i in range(2):
+            events.append(("slice", i))
             time.sleep(0.4)  # a slice longer than the coordinator's whole lease
             yield
 
@@ -245,17 +248,35 @@ class Unit:
 """
 
 
-def test_time_spent_preparing_does_not_count_against_the_coordinators_lease(
-        tmp_path: Path, pkg: str, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_a_slice_longer_than_the_lease_survives_when_keepalives_arrive(tmp_path: Path) -> None:
     """While a slice runs, the coordinator's keepalives wait in the socket until the next safe point.
-    A slice longer than the lease must not make the participant think the coordinator is gone and
-    withdraw (found in review of #15: staging moved one-shot prepares into the slices)."""
+    Checking the lease before advancing the next slice lets rpc.poll() drain those keepalives first,
+    so a slice longer than the lease does not make the participant think the coordinator is gone."""
+
+    async def main() -> None:
+        async with engine(tmp_path, coordinator_timeout_s=0.3, keepalive_interval_s=0.1) as e:
+            e.planner.script = op_everywhere(dict.fromkeys(ALL, {"slices": 2, "slice_s": 0.4}))
+            r = await e.coord.submit(ChangeSet(base=e.coord.identity))
+            assert r.status == "committed", r.diagnostics
+            for p in ALL:
+                st = await e.status(p)
+                assert not [d for d in st.diagnostics if d.code == "change.coordinator_lost"], st.diagnostics
+                assert len(e.slices(p)) == 2
+
+    run(main())
+
+
+def test_a_slice_longer_than_the_lease_withdraws_when_no_keepalive_arrives(
+        tmp_path: Path, pkg: str, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Slice work does not extend the lease indefinitely: if no message from the coordinator
+    arrives during a slow slice, the next safe point withdraws instead of starting another slice."""
     unit = spec(f"{pkg}.slow", f"{pkg}.slow:Unit")
     v1 = write_tree(tmp_path / "snapshots" / "v1" / "engine", {f"{pkg}/slow.py": SLOW_SLICES})
     host = in_process_host(ProcessPlan(PROC, Identity("v1"), [unit], code_root=str(v1)), monkeypatch)
     try:
         r = deliver(host, Prepare(1, Identity("v1"), ProcActions(PROC, actions=[UnitAction(unit.id, "work")]), 0.3))
-        assert isinstance(r, Ok), r
-        assert not [d for d in host.participant.diagnostics if d.code == "change.coordinator_lost"]
+        assert not isinstance(r, Ok), r
+        assert events == [("slice", 0)], events
+        assert [d for d in host.participant.diagnostics if d.code == "change.coordinator_lost"]
     finally:
         host.shutdown()
