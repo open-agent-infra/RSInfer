@@ -9,9 +9,10 @@ process ends, however it ends (``PR_SET_PDEATHSIG``; should that process end bef
 it, the step builds to the end, and lets its locks go then).
 
 What the step started ends with it, by session and not by process group: ``ninja`` runs each
-compiler in a group of its own. On an undo the participant sees to that (``_stop_build``). When the
-participant's process is gone, nobody else does, so the step does it itself: SIGTERM to the rest of
-its session, and SIGKILL to what is left of it after the given seconds
+compiler in a group of its own. On SIGTERM the step stops the rest of its own session, even if the
+parent PID is still visible: Linux can deliver the parent-death signal when the spawning thread
+exits. The participant also enforces cleanup on an undo (``_stop_build``). The step sends SIGTERM
+to the rest of its session and SIGKILL to what is left of it after the given seconds
 (``change.build_stop_grace_s``).
 """
 
@@ -50,15 +51,14 @@ def signal_session(sid: int, sig: int, *, leader: bool = True) -> int:
 
 def run(entry: str, grace_s: float) -> None:
     sid, parent = os.getsid(0), os.getppid()
-
-    def orphaned() -> bool:
-        """The process that started this one is gone (this one has another parent now), and this
-        one leads its session, as that process started it: the session is this step's own."""
-        return os.getppid() != parent and os.getpgid(0) == sid
+    owns_session = os.getpid() == sid
+    stopping = False
 
     def stop(signum: int, frame: FrameType | None) -> None:
+        nonlocal stopping
+        stopping = True
         signal.signal(signal.SIGTERM, signal.SIG_IGN)  # once: a second one would cut the cleanup short
-        if orphaned():  # the compilers first, then (SystemExit) the lock on what they write
+        if owns_session:  # the compilers first, then (SystemExit) the lock on what they write
             signal_session(sid, signal.SIGTERM, leader=False)
         raise SystemExit(128 + signum)
 
@@ -68,7 +68,7 @@ def run(entry: str, grace_s: float) -> None:
     try:
         getattr(importlib.import_module(module), function)()
     finally:
-        if orphaned():
+        if owns_session and (stopping or os.getppid() != parent):
             signal.signal(signal.SIGTERM, signal.SIG_IGN)
             signal_session(sid, signal.SIGTERM, leader=False)
             deadline = time.monotonic() + grace_s

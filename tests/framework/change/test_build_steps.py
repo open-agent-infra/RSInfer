@@ -141,8 +141,9 @@ def test_an_undone_build_step_leaves_no_compiler_and_no_lock_and_the_source_buil
     run(main())
 
 
+@pytest.mark.parametrize("parent_still_visible", [False, True], ids=["host-killed", "term-before-reparenting"])
 def test_a_build_step_whose_process_was_killed_takes_its_compilers_with_it(
-        tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch, parent_still_visible: bool) -> None:
     """SIGKILL to the process whose step compiles: nobody is left to stop the step's session from
     outside. Before, the step got SIGTERM from the kernel, let its lock go and killed the ``ninja``
     it waited for, and that was all: the compiler ``ninja`` had started went on, beside the next
@@ -165,7 +166,12 @@ def test_a_build_step_whose_process_was_killed_takes_its_compilers_with_it(
             its = compilers()  # ninja and nvcc of the one step that compiles; the others wait on the lock
             host = int((work / "host").read_text())
             assert host in [e.c.sup.local_pid(p) for p in ALL]
-            os.kill(host, signal.SIGKILL)
+            if parent_still_visible:
+                # Deliver the parent-death signal to the build leader while getppid() still returns
+                # the host PID, as can happen while a multithreaded host is exiting on Linux.
+                os.kill(os.getsid(its[0]), signal.SIGTERM)
+            else:
+                os.kill(host, signal.SIGKILL)
             await wait_until(lambda: not any(alive(p) for p in its), timeout=10)  # a 1 s grace: they ignore SIGTERM
             r = await change
             assert r.status != "committed", r
